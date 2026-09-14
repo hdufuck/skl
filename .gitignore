@@ -1,0 +1,28 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary / artifacts
+*.test
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Go workspace
+go.work
+go.work.sum
+
+# 抓包与凭据（可能含会话 token，切勿提交）
+*.har
+.env
+.token
+token.txt
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
