@@ -1,6 +1,8 @@
 package probe
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -153,5 +155,68 @@ func TestHookHandlerRejectsNonPost(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("非 POST 应返回 405，实际 %d", resp.StatusCode)
+	}
+}
+
+func TestHookHandlerDecompressesGzip(t *testing.T) {
+	ch := make(chan Entry, 1)
+	srv := httptest.NewServer(NewHookHandler(ch, nil))
+	defer srv.Close()
+
+	plain := harBody(harEntryJSON("POST", "https://skl.hdu.edu.cn/api/ali-nvc/captcha-verify?code=1", 200, "application/json", `{"captchaVerifyResult":true,"checkCodeDto":{}}`))
+
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	if _, err := zw.Write(plain); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL, &compressed)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Encoding", "gzip")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	select {
+	case e := <-ch:
+		if e.Status != 200 || e.Verdict != VerdictSuccess {
+			t.Fatalf("gzip 上报未被正确解析: %+v", e)
+		}
+	default:
+		t.Fatal("gzip 上报应被解压并推入通道")
+	}
+}
+
+func TestDecodeHookBody(t *testing.T) {
+	plain := []byte(`{"ok":true}`)
+
+	if got, err := decodeHookBody(plain, ""); err != nil || string(got) != string(plain) {
+		t.Fatalf("identity 应原样返回: %q %v", got, err)
+	}
+
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	_, _ = zw.Write(plain)
+	_ = zw.Close()
+
+	// 声明 gzip。
+	if got, err := decodeHookBody(compressed.Bytes(), "gzip"); err != nil || string(got) != string(plain) {
+		t.Fatalf("gzip 应被解压: %q %v", got, err)
+	}
+	// 未声明但按魔数识别。
+	if got, err := decodeHookBody(compressed.Bytes(), ""); err != nil || string(got) != string(plain) {
+		t.Fatalf("未声明 gzip 也应按魔数识别: %q %v", got, err)
+	}
+	// 不支持的算法要给出可操作错误。
+	if _, err := decodeHookBody(plain, "br"); err == nil {
+		t.Fatal("brotli 应报不支持")
 	}
 }

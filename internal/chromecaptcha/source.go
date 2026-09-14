@@ -237,18 +237,24 @@ func (s *Source) Param(ctx context.Context) (string, error) {
 		return "", errors.New("chromecaptcha: 页面尚未就绪")
 	}
 
+	// 关键：chromedp 的 action 必须跑在**浏览器自己的 context**（New 时创建）上，
+	// 不能直接用调用方的 context，否则 chromedp 会报 invalid context。
+	// 这里把调用方的 deadline / 取消叠加上去。
+	bctx, cancel := s.browserContext(ctx)
+	defer cancel()
+
 	// 清掉上一轮的值，避免拿到旧参数。
-	_ = chromedp.Run(ctx, chromedp.Evaluate(`window.__captchaVerifyParam = ""; true`, nil))
+	_ = chromedp.Run(bctx, chromedp.Evaluate(`window.__captchaVerifyParam = ""; true`, nil))
 
 	// 受信任点击（Input.dispatchMouseEvent），不是 JS 合成事件。
-	if err := chromedp.Run(ctx, chromedp.Click(s.trigger, chromedp.ByQuery)); err != nil {
+	if err := chromedp.Run(bctx, chromedp.Click(s.trigger, chromedp.ByQuery)); err != nil {
 		return "", fmt.Errorf("chromecaptcha: 触发验证码失败: %w", err)
 	}
 
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if p := s.readParam(ctx); p != "" {
+		if p := s.readParam(bctx); p != "" {
 			return p, nil
 		}
 		select {
@@ -256,6 +262,24 @@ func (s *Source) Param(ctx context.Context) (string, error) {
 			return "", fmt.Errorf("chromecaptcha: 等待 captchaVerifyParam 超时: %w", ctx.Err())
 		case <-ticker.C:
 		}
+	}
+}
+
+// browserContext 把调用方的 deadline / 取消叠加到浏览器 context 上。
+func (s *Source) browserContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	var (
+		bctx   context.Context
+		cancel context.CancelFunc
+	)
+	if deadline, ok := ctx.Deadline(); ok {
+		bctx, cancel = context.WithDeadline(s.ctx, deadline)
+	} else {
+		bctx, cancel = context.WithCancel(s.ctx)
+	}
+	stop := context.AfterFunc(ctx, cancel)
+	return bctx, func() {
+		stop()
+		cancel()
 	}
 }
 

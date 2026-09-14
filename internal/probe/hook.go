@@ -1,6 +1,9 @@
 package probe
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -122,6 +125,43 @@ func ParseHARExchange(body []byte) (*Entry, error) {
 // Reqable 每完成一个会话就 POST 一份 HAR JSON 过来；本 handler 解析出
 // captcha-verify 那条并推入 ch（推不进去就丢弃，不阻塞、不影响抓包）。
 // 无论解析成败都返回 200，因为 Reqable 不会重试。
+// decodeHookBody 按 Content-Encoding 解压上报体。
+//
+// Reqable 的上报服务器支持 gzip / brotli / zstd / none；本实现只支持 gzip 与
+// deflate（零额外依赖），其余给出可操作的错误提示。
+// 另外兼容「声明没压缩、实际是 gzip」的情况（按魔数识别）。
+func decodeHookBody(raw []byte, contentEncoding string) ([]byte, error) {
+	switch enc := strings.ToLower(strings.TrimSpace(contentEncoding)); enc {
+	case "", "identity":
+		if len(raw) >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+			return gunzip(raw)
+		}
+		return raw, nil
+	case "gzip", "x-gzip":
+		return gunzip(raw)
+	case "deflate":
+		zr := flate.NewReader(bytes.NewReader(raw))
+		defer func() { _ = zr.Close() }()
+		return io.ReadAll(io.LimitReader(zr, maxHookBodyBytes))
+	default:
+		return nil, fmt.Errorf("不支持的压缩算法 %q", enc)
+	}
+}
+
+func gunzip(raw []byte) ([]byte, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = zr.Close() }()
+	return io.ReadAll(io.LimitReader(zr, maxHookBodyBytes))
+}
+
+// NewHookHandler 返回 Reqable「上报服务器」的接收端点。
+//
+// Reqable 每完成一个会话就 POST 一份 HAR JSON 过来；本 handler 解析出
+// captcha-verify 那条并推入 ch（推不进去就丢弃，不阻塞、不影响抓包）。
+// 无论解析成败都返回 200，因为 Reqable 不会重试。
 func NewHookHandler(ch chan<- Entry, logf func(format string, args ...any)) http.Handler {
 	if logf == nil {
 		logf = func(string, ...any) {}
@@ -134,6 +174,14 @@ func NewHookHandler(ch chan<- Entry, logf func(format string, args ...any)) http
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxHookBodyBytes))
 		if err != nil {
 			logf("hook: 读取上报体失败: %v", err)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Reqable 的上报服务器可选 gzip/brotli/zstd/none；本实现只支持 gzip/deflate。
+		body, err = decodeHookBody(body, r.Header.Get("Content-Encoding"))
+		if err != nil {
+			logf("hook: 解压上报体失败: %v（请把上报服务器的压缩选成 gzip 或 none）", err)
 			w.WriteHeader(http.StatusOK)
 			return
 		}

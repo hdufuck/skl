@@ -377,16 +377,51 @@ func extractParam(text string) string {
 	return ""
 }
 
+// lanIP 选一个真正的局域网 IPv4（优先 192.168.*，其次 10.* / 172.16-31.*）。
+//
+// 不用 `net.Dial("udp", "8.8.8.8:80")` 那个技巧：在开了 VPN/tun 的机器上它
+// 常会选中 198.18.0.0/15 这类非局域网地址，手机根本连不上。
 func lanIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return "<本机局域网IP>"
 	}
-	defer func() { _ = conn.Close() }()
-	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-		return addr.IP.String()
+	best, bestRank := "", 0
+	for _, ifi := range ifaces {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, addrErr := ifi.Addrs()
+		if addrErr != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			v4 := ipnet.IP.To4()
+			if v4 == nil || ipnet.IP.IsLoopback() || ipnet.IP.IsLinkLocalUnicast() {
+				continue
+			}
+			rank := 0
+			switch {
+			case v4[0] == 192 && v4[1] == 168:
+				rank = 3
+			case v4[0] == 10:
+				rank = 2
+			case v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31:
+				rank = 2
+			}
+			if rank > bestRank {
+				best, bestRank = v4.String(), rank
+			}
+		}
 	}
-	return "<本机局域网IP>"
+	if best == "" {
+		return "<本机局域网IP>"
+	}
+	return best
 }
 
 func envOr(key, fallback string) string {

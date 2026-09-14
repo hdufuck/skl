@@ -265,7 +265,8 @@ T0 后的时序：
      - 名称：`skl-captcha`
      - URL 匹配：`*captcha-verify*`
      - 服务端地址：`http://127.0.0.1:8080/hook`（脚本与电脑端同机）
-     - 压缩：`gzip`（脚本能解；HAR 本身仍是 JSON）
+     - 压缩：`gzip`（或 `none`）。脚本能解 gzip/deflate；**不要选 brotli/zstd**，
+       这两种会记一条「不支持的压缩算法」日志并被忽略。
    - **手机端（独立模式）**：Reqable → ⋮ → 更多 → 上报服务器 → 新建（需 ≥ v2.20.0）。
      - 服务端地址改成 `http://<脚本打印的Mac局域网IP>:8080/hook`
      - 手机必须与 Mac 同一局域网。
