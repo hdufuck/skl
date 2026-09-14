@@ -186,10 +186,14 @@ func run() error {
 		defer func() { _ = srv.Close() }()
 
 		addr := opt.hookAddr
-		if strings.HasPrefix(addr, ":") {
-			addr = lanIP() + addr
+		_, port, splitErr := net.SplitHostPort(addr)
+		if splitErr != nil {
+			port = "8080"
 		}
-		fmt.Fprintf(os.Stderr, "[probe] Reqable 上报服务器：http://%s/hook（手机端按 docs/signin-probe.md 配置）\n", addr)
+		fmt.Fprintf(os.Stderr, "[probe] Reqable 上报服务器地址（按你的抓包模式二选一）：\n")
+		fmt.Fprintf(os.Stderr, "[probe]   协同模式（配在电脑端 Reqable）: http://127.0.0.1:%s/hook\n", port)
+		fmt.Fprintf(os.Stderr, "[probe]   独立模式（配在手机端 Reqable）: http://%s:%s/hook\n", lanIP(), port)
+		fmt.Fprintf(os.Stderr, "[probe]   配置步骤见 docs/signin-probe.md §4.3\n")
 	}
 
 	// ---------- T0 ----------
