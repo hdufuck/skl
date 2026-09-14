@@ -57,7 +57,7 @@ func TestSignInLegacyAnalyzeUnwrapsJSONP(t *testing.T) {
 	c := newMockClient(t, m, WithToken(m.Token))
 
 	got, err := c.SignInLegacyAnalyze(t.Context(), AnalyzeRequest{
-		SignInRequest: SignInRequest{Code: "9999", UserID: "24000000"},
+		Code: "9999", UserID: "24000000",
 	})
 	if err != nil {
 		t.Fatalf("SignInLegacyAnalyze: %v", err)
@@ -97,7 +97,7 @@ func TestSignInLegacyAnalyzeSuccessAndCaptchaCodes(t *testing.T) {
 		c := newMockClient(t, m, WithToken(m.Token))
 
 		got, err := c.SignInLegacyAnalyze(t.Context(), AnalyzeRequest{
-			SignInRequest: SignInRequest{Code: "9999", UserID: "24000000"},
+			Code: "9999", UserID: "24000000",
 		})
 		if err != nil {
 			t.Fatalf("code=%d: %v", tt.code, err)
@@ -108,6 +108,67 @@ func TestSignInLegacyAnalyzeSuccessAndCaptchaCodes(t *testing.T) {
 		if got.CaptchaRequired() != tt.wantCaptcha {
 			t.Fatalf("code=%d: CaptchaRequired() = %v, want %v", tt.code, got.CaptchaRequired(), tt.wantCaptcha)
 		}
+	}
+}
+
+// 前端 check-code-analyze 只上报 userid/code/t/token/a，完全不传定位。
+// 这条不变式很容易在重构中被“顺手加上坐标”破坏。
+func TestSignInLegacyAnalyzeSendsNoLocation(t *testing.T) {
+	t.Parallel()
+
+	m := newMockSkl(t)
+	c := newMockClient(t, m, WithToken(m.Token))
+
+	if _, err := c.SignInLegacyAnalyze(t.Context(), AnalyzeRequest{
+		Code: "9999", UserID: "24000000", Timestamp: 1700000000000,
+	}); err != nil {
+		t.Fatalf("SignInLegacyAnalyze: %v", err)
+	}
+
+	m.mu.Lock()
+	got := m.lastAnalyzeQuery
+	m.mu.Unlock()
+
+	for _, forbidden := range []string{"latitude", "longitude"} {
+		if got.Has(forbidden) {
+			t.Fatalf("遗留 JSONP 签到不应上报 %s，实际 query=%v", forbidden, got)
+		}
+	}
+
+	for _, key := range []string{"userid", "code", "token", "a", "callback", "t"} {
+		if !got.Has(key) {
+			t.Fatalf("缺少参数 %s，实际 query=%v", key, got)
+		}
+	}
+	if got.Get("a") != AnalyzeNVCValueNone {
+		t.Fatalf("a = %q, want %q", got.Get("a"), AnalyzeNVCValueNone)
+	}
+	if got.Get("token") != m.Token {
+		t.Fatalf("token = %q, want %q", got.Get("token"), m.Token)
+	}
+}
+
+// SignInLegacy 的定位是可选上报：不传时不应凭空补 0。
+func TestSignInLegacyOmitsLocationWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	m := newMockSkl(t)
+	c := newMockClient(t, m, WithToken(m.Token))
+
+	_, err := c.SignInLegacy(t.Context(), SignInRequest{Code: "9999", UserID: "24000000"})
+	if err == nil {
+		t.Fatal("期望服务端返回业务错误")
+	}
+
+	m.mu.Lock()
+	got := m.lastCodeCheckInQuery
+	m.mu.Unlock()
+
+	if got.Has("latitude") || got.Has("longitude") {
+		t.Fatalf("未提供定位时不应上报 latitude/longitude，实际 query=%v", got)
+	}
+	if got.Get("code") != "9999" || got.Get("id") != "24000000" {
+		t.Fatalf("code/id 不正确: %v", got)
 	}
 }
 
@@ -184,12 +245,13 @@ func TestSignInUsesCaptchaProvider(t *testing.T) {
 func TestFormatCoordinate(t *testing.T) {
 	t.Parallel()
 
+	// 最短往返表示，不做补零（与前端直接序列化 JS Number 一致）。
 	tests := map[float64]string{
 		30.123456:  "30.123456",
 		120.654321: "120.654321",
-		0:          "0.000000",
-		-0.5:       "-0.500000",
-		30.1234567: "30.123456",
+		30.1234567: "30.1234567",
+		0:          "0",
+		-0.5:       "-0.5",
 	}
 	for in, want := range tests {
 		if got := formatCoordinate(in); got != want {

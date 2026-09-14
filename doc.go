@@ -78,6 +78,85 @@
 //     （它俩所依赖的 HTTP 调用在抓包里可见，但真正的设备指纹采集与
 //     签名在原生/SDK 内部完成。）
 //
+// # 定位信息（geolocation）
+//
+// skl 的签到是地理位置绑定的，而定位**完全由客户端提供**。这一节把整条
+// 定位链写清楚，因为它同时是正确性要求和风险点。
+//
+// ## 定位从哪来
+//
+// 前端的 getLocation 分两条路（用 UA 里有没有 `DingTalk` 判断）：
+//
+//	钉钉内：
+//	  dd.device.geolocation.get({
+//	      targetAccuracy: 50,        // 期望精度 50m（官方推荐 200m）
+//	      coordinate: 0,             // 0 = 标准坐标(WGS-84)，1 = 高德坐标(GCJ-02)
+//	      withReGeocode: false,      // 不要逆地理编码
+//	      useCache: false,           // 不用客户端 2 分钟缓存
+//	  })
+//
+//	钉钉外：
+//	  navigator.geolocation.getCurrentPosition(..., {
+//	      enableHighAccuracy: true, timeout: 5000, maximumAge: 0,
+//	  })
+//
+// `coordinate: 0` 的语义来自钉钉官方文档（1=高德坐标，0=标准坐标）。但文档
+// 同时说明“Android 客户端返回坐标是高德坐标”，所以 `coordinate: 0` 在
+// Android 上是否真能拿到标准坐标**存疑**。
+//
+// 无论哪条路，前端都**不做任何坐标系转换**（前端产物里搜不到 gcj/wgs/bd09
+// 转换代码），拿到什么就原样作为 latitude/longitude 发出去。
+//
+// ## 定位去哪
+//
+//   - 学生签到 `POST /api/ali-nvc/captcha-verify`：`latitude`、`longitude`
+//     是查询参数（两份 HAR 实测）。
+//   - 教师生成签到码 `POST /api/checkIn/create-code`：请求体带
+//     `{courseId, courseSchemaId, recordDate, latitude, longitude, expiresIn}`。
+//     也就是说**老师生成签到码时所在的定位，就是这次签到的地理围栏中心**；
+//     返回对象里也带 latitude/longitude。
+//   - 遗留的 `/sign/ali` 页（JSONP `check-code-analyze`）：**完全不传定位**，
+//     只上报 userid/code/t/token/a。
+//
+// ## 服务端怎么用它
+//
+// 服务端确实在做距离比对，而不是“只存两个数”：
+//
+//   - `POST /api/checkIn/history-list`（教师端考勤历史）返回的每条学生记录
+//     都带 `distance` 字段，单位米。
+//   - 教师端 UI 以 2000m 为界着色：`distance < 2000` 绿色，
+//     `distance >= 2000` 红色并显示「异常」。
+//
+// 也就是说坐标偏得越远，越可能在教师端被标成「异常」。但 2000 这个阈值
+// 只是前端展示逻辑，**不能**当作服务端的接受阈值（服务端可能仍然记账）。
+//
+// ## 信息在客户端就被丢掉了
+//
+// 钉钉的定位回调还会返回 `accuracy`（实际精度）、`isFromMock`
+// （仅 Android：定位结果是否为模拟）、`provider`、`isGpsEnabled` 等字段。
+// skl 前端**只取 latitude/longitude，其余全部丢弃**，也没有上报给后端。
+//
+// 后果：设备层其实有能力识别模拟定位，但**后端拿不到这个信号**，
+// 它看到的永远只是两个 float。
+//
+// ## 对 Go 调用方的要求
+//
+//   - 本包不代取定位，必须由调用方自己提供 `Latitude`/`Longitude`；
+//     缺失（0,0）会导致签到失败或产生错误距离。
+//   - **坐标系要与前端一致**（`coordinate: 0`，标准/WGS-84）。混用高德
+//     坐标会带来数百米级偏移，足以改变围栏判定。
+//   - 服务端**不向未签到的人提供教室坐标**，所以无法在签到前自检距离。
+//
+// ## 抓包里的定位旁路流量
+//
+// HAR 里还有几条与定位相关的请求，属于**原生 SDK 的定位与风控链路**，
+// 与本包无关（我们直接给数值）：
+//
+//   - `dualstack-a.apilocate.amap.com/mobile/binary` —— 高德定位 SDK
+//   - `cloudauth-device-dualstack.cn-shanghai.aliyuncs.com` —— 阿里云设备
+//     指纹（风控标的物，也会采集定位）
+//   - `voilatile-pa.googleapis.com/.../FindTiles` —— Android 系统定位服务
+//
 // # 最小用例
 //
 //	client, err := skl.NewClient(
@@ -191,13 +270,13 @@
 // 本包不会自动重试空 body 响应。调用方应把 ErrEmptyBody 当作需要退避的
 // 信号而不是立刻重试 —— 这个建议在两种成因下都成立。
 //
-// ## 6. 定位由客户端上报，服务端只做数值校验
+// ## 6. 定位由客户端上报，可伪造；但服务端确实会做距离比对
 //
-// 签到请求的 latitude/longitude 由客户端提供（钉钉内是
-// `device.geolocation.get`，浏览器里是 navigator.geolocation）。
-// 服务端拿到的就是这两个数，因此理论上可以伪造。
-// 这属于使用者的责任边界，本包只提供参数透传。
-// 注意缺失定位会导致签到直接失败。
+// 详见上面「定位信息」一节。要点：后端只拿到两个 float
+// （客户端把 `accuracy`、`isFromMock` 等字段全部丢掉了），所以从后端视角
+// 定位是纯客户端输入、可伪造；但服务端会用**教师生成签到码时的定位**算出
+// distance，教师端把 >= 2000m 的标为「异常」。
+// 这属于使用者的责任边界，本包只做参数透传。缺失定位会导致签到失败。
 //
 // ## 7. 会话 token 的生命周期未知
 //

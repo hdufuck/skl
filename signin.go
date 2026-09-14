@@ -118,10 +118,18 @@ func (c *Client) SignInLegacy(ctx context.Context, req SignInRequest) (*SignInRe
 	}
 
 	query := url.Values{
-		"code":      {req.Code},
-		"id":        {userID},
-		"latitude":  {formatCoordinate(req.Latitude)},
-		"longitude": {formatCoordinate(req.Longitude)},
+		"code": {req.Code},
+		"id":   {userID},
+	}
+	// 定位只在调用方确实提供时上报。
+	//
+	// 这里的参数集是**推断**的：前端只把该方法注册为
+	// `signIn(n){return o.get("/checkIn/code-check-in",{params:n})}`，
+	// 没有任何页面调用它，抓包里也没有这个请求，所以无法像 captcha-verify
+	// 那样逐字节对齐。已知 code 与 id 能让服务端走到业务校验（实测）。
+	if req.Latitude != 0 || req.Longitude != 0 {
+		query.Set("latitude", formatCoordinate(req.Latitude))
+		query.Set("longitude", formatCoordinate(req.Longitude))
 	}
 
 	resp, err := c.Get(ctx, PathSignInLegacy, query)
@@ -153,8 +161,16 @@ const (
 )
 
 // AnalyzeRequest 描述一次遗留 JSONP 签到请求。
+//
+// 注意这里**没有**经纬度：前端 /sign/ali 页在调 check-code-analyze 时
+// 只上报 `userid`、`code`、`t`、`token`、`a` 五个参数，完全不传定位。
+// 这是该路径与 captcha-verify 的一个实质差别，因此不提供位置字段，
+// 以免调用方以为传了会有用。
 type AnalyzeRequest struct {
-	SignInRequest
+	// Code 是 4 位签到码。
+	Code string
+	// UserID 默认为当前登录用户的 id。
+	UserID string
 	// NVCValue 是阿里云 AWSC nvc 的 `getNVCValAsync` 结果。
 	// 服务端判定无需二次验证时前端会直接上报 "0"（AnalyzeNVCValueNone）。
 	NVCValue string
@@ -220,10 +236,6 @@ func (c *Client) SignInLegacyAnalyze(ctx context.Context, req AnalyzeRequest) (*
 	}
 	if req.Timestamp != 0 {
 		query.Set("t", strconv.FormatInt(req.Timestamp, 10))
-	}
-	if req.Latitude != 0 || req.Longitude != 0 {
-		query.Set("latitude", formatCoordinate(req.Latitude))
-		query.Set("longitude", formatCoordinate(req.Longitude))
 	}
 
 	resp, err := c.Get(ctx, PathSignInAnalyze, query)
@@ -303,9 +315,16 @@ func (c *Client) resolveUserID(ctx context.Context, userID string) (string, erro
 	return user.ID, nil
 }
 
-// formatCoordinate 按前端一致的方式格式化经纬度（保留 6 位小数）。
+// formatCoordinate 把经纬度序列化成服务端可解析的十进制字符串。
+//
+// 用最短往返表示（-1 位）而不是固定小数位：前端是把 axios 的 JS Number
+// 直接序列化过去的，没有做任何补零或截断，抓包里的 6 位小数只是那个值
+// 本来如此。固定 6 位会引入前端并不存在的舍入。
+//
+// 坐标系：见 doc.go「定位信息」——前端用的是钉钉 `coordinate: 0`，
+// 即**标准坐标（WGS-84）**，因此调用方给的值必须是同一坐标系。
 func formatCoordinate(v float64) string {
-	return strconv.FormatFloat(v, 'f', 6, 64)
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 // newJSONPCallback 生成 JSONP 回调名。

@@ -31,6 +31,11 @@ type mockSkl struct {
 	// AnalyzeJSONP 为 check-code-analyze 的 JSONP 响应模板（%s 替换为回调名）。
 	AnalyzeJSONP string
 
+	// lastAnalyzeQuery / lastCodeCheckInQuery 记录签到类接口收到的 query，
+	// 用于断言“遗留路径不上报定位”这类参数集不变式。
+	lastAnalyzeQuery     url.Values
+	lastCodeCheckInQuery url.Values
+
 	server *httptest.Server
 
 	mu           sync.Mutex
@@ -133,6 +138,10 @@ func newMockSkl(t *testing.T) *mockSkl {
 	})
 
 	mux.HandleFunc("/api/ali-nvc/check-code-analyze", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		m.lastAnalyzeQuery = r.URL.Query()
+		m.mu.Unlock()
+
 		tpl := m.AnalyzeJSONP
 		if tpl == "" {
 			tpl = `%s({"result":{"code":800}})`
@@ -141,7 +150,11 @@ func newMockSkl(t *testing.T) *mockSkl {
 		_, _ = fmt.Fprintf(w, tpl, r.URL.Query().Get("callback"))
 	})
 
-	mux.HandleFunc("/api/checkIn/code-check-in", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/api/checkIn/code-check-in", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		m.lastCodeCheckInQuery = r.URL.Query()
+		m.mu.Unlock()
+
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = io.WriteString(w, `{"code":0,"msg":"签到码不存在，不要玩我"}`)
 	})

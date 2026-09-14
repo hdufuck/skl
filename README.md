@@ -104,7 +104,7 @@ resp, err := client.Raw(ctx, http.MethodPost, "/api/checkIn/update", query, body
 ```go
 result, err := client.SignIn(ctx, skl.SignInRequest{
     Code:      "1212",
-    Latitude:  30.123456,
+    Latitude:  30.123456,   // 必须与前端同坐标系：coordinate:0 = 标准/WGS-84
     Longitude: 120.654321,
 })
 ```
@@ -200,6 +200,72 @@ CAS/SSO 表单，效果等价。**但如果学校改成只保留免登、关闭�
 - 钉钉 JSAPI 桥（`dd.*`：`device.geolocation.get`、`biz.util.scan`、`biz.chat.*`）。
 - 验证码 `data` / `deviceToken` 的生成过程（其依赖的 HTTP 调用在抓包里可见，
   但真正的设备指纹采集与签名在原生/SDK 内部完成）。
+
+## 定位信息
+
+签到是地理位置绑定的，而**定位完全由客户端提供**。
+
+### 定位从哪来
+
+前端分两条路（看 UA 里有没有 `DingTalk`）：
+
+```js
+// 钉钉内
+dd.device.geolocation.get({
+    targetAccuracy: 50,        // 期望精度 50m（官方推荐 200m）
+    coordinate: 0,             // 0 = 标准坐标(WGS-84)，1 = 高德坐标(GCJ-02)
+    withReGeocode: false,
+    useCache: false,           // 不用客户端 2 分钟缓存
+})
+
+// 钉钉外
+navigator.geolocation.getCurrentPosition(..., {
+    enableHighAccuracy: true, timeout: 5000, maximumAge: 0,
+})
+```
+
+`coordinate: 0` 的语义来自钉钉官方文档（1=高德坐标，0=标准坐标）。但文档同时说
+“Android 客户端返回坐标是高德坐标”，所以 `coordinate: 0` 在 Android 上能否真的
+拿到标准坐标**存疑**。前端**不做任何坐标系转换**（产物里搜不到 gcj/wgs/bd09 转换）。
+
+### 定位去哪
+
+| 谁 | 请求 | 定位 |
+| --- | --- | --- |
+| 学生签到 | `POST /api/ali-nvc/captcha-verify` | `latitude`/`longitude`（HAR 实测） |
+| 教师生成签到码 | `POST /api/checkIn/create-code` | 请求体带 `{courseId, courseSchemaId, recordDate, latitude, longitude, expiresIn}` |
+| 遗留 `/sign/ali` | `GET /api/ali-nvc/check-code-analyze` | **完全不传定位**（只报 userid/code/t/token/a） |
+
+关键：**老师生成签到码时所在的定位，就是这次签到的地理围栏中心**。
+
+### 服务端确实在做距离比对
+
+`POST /api/checkIn/history-list`（教师端考勤历史）返回的每条学生记录都带
+`distance` 字段（米），教师端 UI 把 `distance < 2000` 显示为绿色、
+`>= 2000` 显示为红色 +「异常」。
+
+所以坐标偏得越远越可能被标「异常」。但 2000 只是**前端展示阈值**，
+不能当作服务端的接受阈值。
+
+### 信息在客户端就被丢掉了
+
+钉钉定位回调还会返回 `accuracy`、`isFromMock`（仅 Android：是否为模拟定位）、
+`provider`、`isGpsEnabled`。skl 前端**只取 latitude/longitude，其余全部丢弃**，
+也没有上报给后端 ⟹ 设备层能识别模拟定位，但**后端拿不到这个信号**，
+它看到的永远只是两个 float。
+
+### 对调用方的要求
+
+- 本包**不代取定位**，`Latitude`/`Longitude` 必须由你提供；缺失会让签到失败。
+- **坐标系要与前端一致**（`coordinate: 0`，标准/WGS-84）。混用高德坐标会有
+  数百米级偏移，足以改变围栏判定。
+- 服务端不向未签到的人提供教室坐标，**无法在签到前自检距离**。
+
+### 抓包里的定位旁路流量
+
+`dualstack-a.apilocate.amap.com`（高德定位 SDK）、`cloudauth-device-dualstack`
+（阿里云设备指纹）这些属于**原生 SDK 的定位与风控链路**，和本包无关——
+我们直接给数值。
 
 ## 其它已实测的行为约束
 
