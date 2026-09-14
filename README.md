@@ -20,7 +20,7 @@
 | 只读接口（用户、课表、考勤统计、考核项） | ✅ 已验证 |
 | skl-ticket 一次性 nonce 语义 | ✅ 已验证 |
 | 签到（`captcha-verify`） | ⚠️ 协议已封装，但依赖阿里云验证码参数，见下 |
-| 签到（遗留无验证码路径） | ⚠️ 可调用，但语义未能证实 |
+| 签到（遗留无验证码路径） | ⚠️ 可调用，但现行前端已不再使用，且探针只能作单边证据 |
 | 钉钉免登（exempt-login）鉴权 | ❌ 未实现（需应用内 OAuth code） |
 | 钉钉 JSAPI（扫一扫、精确定位等） | ❌ 不在网络层，无法复现 |
 
@@ -106,7 +106,7 @@ resp, err := client.Raw(ctx, http.MethodPost, "/api/checkIn/update", query, body
 ```go
 result, err := client.SignIn(ctx, skl.SignInRequest{
     Code:      "1212",
-    Latitude:  30.123456,   // 必须与前端同坐标系：coordinate:0 = 标准/WGS-84
+    Latitude:  30.123456,   // 坐标系必须与前端一致（前端向 coordinate 传 0，其语义尚未证实，见「定位信息」）
     Longitude: 120.654321,
 })
 ```
@@ -178,11 +178,23 @@ if result.CaptchaRequired() { /* 400：服务端要求滑块 */ }
 所以本包没有替你决定。
 
 同理，遗留接口 `checkIn/code-check-in` 与 `ali-nvc/check-code-analyze`
-是「最可能不需要验证码」的路径（后者是阿里云 NVC 的风险自适应形态，
-前端平时直接上报 `a=0`），但同样无法在拿到有效签到码前证伪。
+也**不能在拿到有效签到码前证伪**。但要注意：bundle 级检索显示它们**不是**「官方页面也会走的备用路」——
+`code-check-in` 零调用者，`check-code-analyze` 所在路由 `/sign/location` 不可达
+（且它传的 `code` 是定位就绪标志的布尔值，不是签到码）。所以用它们做探针只能得到**单边证据**：
+成功才算证明不强制，失败不可解释。
 
-> 跟踪中：**[issue #1 — 用安卓模拟器/容器逆向验证码](https://github.com/hdufuck/skl/issues/1)**
-> （要回答的正是「是否强制」与「成功响应结构」这两块空白）
+**完整的判定方法见 [`docs/signin-experiment.md`](docs/signin-experiment.md)**：
+
+| 步骤 | 内容 |
+| --- | --- |
+| 1 | 官方正常签到（拿成功响应全文 + 确认读回端点可用） |
+| 2 | 有效码 + **缺失** `captchaVerifyParam`（直接回答「是否强制」） |
+| 3 | 有效码 + **结构合法但伪造**的凭证（把参数层与人机层分开） |
+| 4 | 有效码 + **重放**同一个已用过的凭证（回答「是否一次性」） |
+
+单变量纪律（除该字段外逐字节沿用官方请求）、判读表、应急方案与脱敏规则都在那份手册里。
+这套实验的约束（为什么只能用真机、为什么不能在别的机器上发探针、为什么结论只作单边证据）
+见 [`docs/adr/0001-证据只能来自一次真实签到窗口.md`](docs/adr/0001-证据只能来自一次真实签到窗口.md)。
 
 ## 未覆盖的鉴权路径：钉钉免登
 
@@ -265,8 +277,9 @@ navigator.geolocation.getCurrentPosition(..., {
 ### 对调用方的要求
 
 - 本包**不代取定位**，`Latitude`/`Longitude` 必须由你提供；缺失会让签到失败。
-- **坐标系要与前端一致**（`coordinate: 0`，标准/WGS-84）。混用高德坐标会有
-  数百米级偏移，足以让记录被标为「异常」。
+- **坐标系要与前端一致**（前端向 `coordinate` 传 `0`）。混用高德与标准坐标会有
+  数百米级偏移，足以让记录在教师端被标为「异常」。注意 `coordinate: 0` 到底对应
+  哪种坐标系**尚未证实**，详见上文。
 - 服务端不向未签到的人提供教室坐标，**无法在签到前自检距离**。
 
 ### 抓包里的定位旁路流量
@@ -331,6 +344,10 @@ SKL_TOKEN=<localStorage.sessionId> go test -tags integration -run TokenOnly -v .
 
 单元测试用 `httptest` 搭了一个假的 skl 站点，覆盖 CAS 转发、SSO 登录页、
 CAS 回调与 token 下发，因此**整条登录链是可以离线测试的**。
+
+判定「人机验证是否强制」是一次性的现场实验，**不在测试套件里**：
+按 [`docs/signin-experiment.md`](docs/signin-experiment.md) 执行——抓包环境、
+单变量纪律、探针顺序、判读表与脱敏规则都写在那里，不要临场发挥。
 
 > ⚠️ **不要把真实数据写进代码或文档。** 本文库会公开，而抓包/真机调试很容易
 > 顺手把真实学号、姓名、手机号、**当时的 GPS 坐标**、以及**仍然有效的会话 token**

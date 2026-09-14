@@ -57,7 +57,7 @@ https://skl.hdu.edu.cn/api
 
 - 日期：`2006-01-02`（如 `startTime=2026-09-14`、`startDate`/`endDate`）
 - 时间戳：毫秒（`recordDate`、`expiresIn`、`t`）
-- 经纬度：十进制浮点；前端用钉钉 `coordinate: 0`（**标准/WGS-84**）
+- 经纬度：十进制浮点；前端用钉钉 `coordinate: 0`（⚠️ 它到底对应哪种坐标系未证实，见 §5）
 - 大批接口用 `params`（query）而非 body，即使语义上是写操作
 - 数组与复杂对象常见于 POST body
 
@@ -113,12 +113,18 @@ GET  /cas/login?ticket= → 302 → https://skl.hdu.edu.cn/index.html#?token=<uu
 | GET | `/checkIn/valid-code` | `code`、`id` | ✅ | 图形验证码流程；无会话时 `400 + 空 body` |
 | GET | `/checkIn/create-code-img` | — | ✅ | 返回图片 blob（图形验证码） |
 
-**`captcha-verify` 的响应**（字段名取自前端源码，ⓘ 抓包里的两次签到都 401，
-所以成功响应未实测）：
+**`captcha-verify` 的响应**（📖 字段名与消费方式取自前端 bundle，⚠️ 抓包里的两次签到都
+401，所以成功响应未实测）：
 
 ```json
 { "captchaVerifyResult": ..., "checkCodeDto": ... }
 ```
+
+📖 前端的消费方式（`index-new-*.js` 的人机回调）：把 `captchaVerifyResult` 直接交给阿里云
+SDK 当 `captchaResult`，并要求**严格 `=== true`** 才跳 `/sign/in/detail`；
+`false`/`undefined` 会让 SDK 重开滑块，其它真值则静默无操作。`checkCodeDto` 被整体存入
+store，只在其它页面读到 `courseId`、`courseName`、`id`、`courseSchemaId`、`teachName`、
+`recordDate`（**没有任何地方读 `distance`**）。
 
 `check-code-analyze` 的业务码（前端分支判断）：`100`/`200` 成功，
 `400` 要求滑块，`800`/`900` 被拒。实测无效签到码得到 `800`。
@@ -126,6 +132,18 @@ GET  /cas/login?ticket= → 302 → https://skl.hdu.edu.cn/index.html#?token=<uu
 > ⚠️ 人机验证是否**强制**无法用无效签到码证伪：签到码校验先于验证码，
 > 缺失/伪造/不传 `captchaVerifyParam` 都返回同一个
 > `401 {"code":0,"msg":"签到码不存在，不要玩我"}`。
+> 判定方法见 **[签到实验手册](./signin-experiment.md)**。
+
+📖 三条遗留路径在现行前端里的实际地位（全 bundle 级检索）：
+
+| 路径 | 现状 |
+| --- | --- |
+| `GET /checkIn/code-check-in` | axios 里有定义，**零调用者** |
+| `GET /ali-nvc/check-code-analyze` | 只被 `/sign/location` 调用，而该路由**不可达**（只出现在路由表里，无 `meta.level`、无任何跳转指向它）；且它传的 `code` 是定位就绪标志的布尔值，接收 4 位签到码的输入框从未被 render 引用 |
+| `GET /checkIn/valid-code` + `/create-code-img` | `/sign/in/valid` 页面的 `mounted()` 在没有图片时立刻跳回 `/sign/in`，而图片只由该页自己设置 ⟹ 自我不可达 |
+
+⟹ 现行前端只有 `captcha-verify` 一条活着的签到路径。上表三条**不是**「官方页面也会走的路」，
+只是仍在服务端注册着的端点。
 
 ### 3.3 考勤查询
 
@@ -310,20 +328,24 @@ GET  /cas/login?ticket= → 302 → https://skl.hdu.edu.cn/index.html#?token=<uu
 
 ## 5. 未证实与已知缺口
 
-> 下面前六项靠**[issue #1](https://github.com/hdufuck/skl/issues/1)**跟踪：
-> 需要一次**真实有效签到码**下的完整签到（建议用安卓模拟器/容器或官方页面抓包），
-> 才能把 ⚠️ / 📖 升级为 ✅。
+> 下面这些项由 **[issue #1](https://github.com/hdufuck/skl/issues/1)** 跟踪，
+> 判定方法见 **[签到实验手册](./signin-experiment.md)**（只能用一次真实有效的签到码，
+> 一次窗口做完；采集与脱敏规则也在那里）。
 
 | 项 | 状态 |
 | --- | --- |
-| `captcha-verify` 成功响应结构 | 只有字段名（源码），无实测样本 |
-| `captcha-verify` 是否**强制**人机验证 | 无法用无效签到码证伪（见 3.2） |
-| `checkIn/code-check-in` 完整参数集 | 仅知 `code`/`id` 可到达业务逻辑 |
-| `/checkIn/stu-check-count` 的 `list` 元素 | 实测为 `[]` |
-| `/check-in-student-detail/*` 响应元素 | 实测为 `[]` |
+| `captcha-verify` 成功响应结构 | 📖 契约已知（`captchaVerifyResult` 必须是严格 `true`，`checkCodeDto` 整体存入 store），⚠️ 无实测样本 |
+| `captcha-verify` 是否**强制**人机验证 | ⚠️ 无法用无效签到码证伪（见 3.2），待窗口 |
+| `checkIn/code-check-in` 完整参数集 | ⚠️ 仅知 `code`/`id` 可到达业务逻辑；📖 且现行前端**零调用者** |
+| `check-code-analyze` 的 `code` 语义 | 📖 前端传的是定位就绪标志（布尔），与签到码无关；所在路由不可达 |
+| `/checkIn/stu-check-count` 的 `list` 元素 | 实测为 `[]`（**基线为空**，不是接口失明） |
+| `/check-in-student-detail/*` 响应元素 | 实测为 `[]`（同上） |
 | 各接口的角色权限边界 | 未逐个验证；403 文案为「没有权限」 |
 | `CheckInCount` 中课程信息字段 | 前端整体展开，按命名惯例补齐，未逐字段实测 |
-| `checkCodeDto` 内部结构 | 完全未知 |
+| `checkCodeDto` 内部结构 | ⚠️ 完全未知（只知被读的六个字段名） |
+| 服务端是否校验 `t` | 本次不证明：需专门探针，且不影响库的形态 |
+| `coordinate: 0` 的坐标系语义 | 本次不证明：需教师端 `distance` 列 |
+| `distance` 超限是否拒签 | 本次不证明：需伪造远端坐标写一条异常记录；该主张已由项目所有者确认，无证据债 |
 
 ---
 
@@ -342,3 +364,7 @@ SKL_TOKEN=<localStorage.sessionId> go test -tags integration -run TokenOnly -v .
 手工探测时注意：**每个请求都要新的 `skl-ticket`**，否则会拿到
 `200 + 空 body` 而误以为接口正常。签到类接口不要拿有效签到码试探——
 它会真的签到。
+
+要判定「人机验证是否强制」时，按 **[签到实验手册](./signin-experiment.md)** 执行：
+抓包环境、单变量纪律、探针顺序、判读表与脱敏规则都写在那里，
+不要临场发挥——那个窗口不可重复。
