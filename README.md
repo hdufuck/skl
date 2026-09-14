@@ -19,8 +19,9 @@
 | token 注入 / 持久化 / 401 自动重登 | ✅ 已验证 |
 | 只读接口（用户、课表、考勤统计、考核项） | ✅ 已验证 |
 | skl-ticket 一次性 nonce 语义 | ✅ 已验证 |
-| 签到（`captcha-verify`） | ⚠️ 协议已封装，但依赖阿里云验证码参数，见下 |
+| 签到（`captcha-verify`） | ⚠️ 协议已封装；真值 `captchaVerifyParam` 由浏览器取参（`internal/chromecaptcha`），待窗口实测 |
 | 签到（遗留无验证码路径） | ⚠️ 可调用，但现行前端已不再使用，且探针只能作单边证据 |
+| 一次性签到探针（`cmd/signinprobe`） | ⚠️ 已实现且单测覆盖；只在真实窗口跑过才算 ✅ |
 | 钉钉免登（exempt-login）鉴权 | ❌ 未实现（需应用内 OAuth code） |
 | 钉钉 JSAPI（扫一扫、精确定位等） | ❌ 不在网络层，无法复现 |
 
@@ -156,16 +157,17 @@ if result.CaptchaRequired() { /* 400：服务端要求滑块 */ }
 | `data` | SDK 内部混淆代码加密的风控载荷，另有 `upload.captcha-open.aliyuncs.com` 遥测上传 |
 
 三者均由阿里云侧签名，与 SceneId、站点域名绑定，且 SDK 会轮换算法。
-**结论：不要在 Go 里重放这套协议。** 推荐用无头浏览器：
+**结论：不要在 Go 里重实现这套协议。** 本仓库的做法是：用真 Chrome 加载
+阿里云官方 SDK（`internal/chromecaptcha`），从 `captchaVerifyCallback` 里取出真值，
+再交给库的 `SignIn` 提交——只借道官方 SDK，不碰协议。
 
-```go
-// chromium + chromedp 思路（不引入依赖，仅示意）
-// 1. 打开 https://skl.hdu.edu.cn/sign/in
-// 2. 注入 localStorage.setItem("sessionId", token)  ← 关键，页面靠它鉴权
-// 3. 输入 4 位签到码（页面自己会调 captcha-verify）
-// 4. 等待跳转到 /sign/in/detail
-// 这条路径完全不碰验证码协议，最稳。
+```text
+1. chromecaptcha：在真实源下交付极简页 → 加载 AliyunCaptcha.js → 点一次触发按钮
+2. 拿到真值 captchaVerifyParam（一次性，90s 内要用掉）
+3. client.SignIn{Code, Latitude, Longitude, CaptchaVerifyParam: 真值}
 ```
+
+完整流程、相位预算与手机端配合见 [`docs/signin-probe.md`](docs/signin-probe.md)。
 
 ### 未能证实的部分
 
@@ -183,18 +185,21 @@ if result.CaptchaRequired() { /* 400：服务端要求滑块 */ }
 （且它传的 `code` 是定位就绪标志的布尔值，不是签到码）。所以用它们做探针只能得到**单边证据**：
 成功才算证明不强制，失败不可解释。
 
-**完整的判定方法见 [`docs/signin-experiment.md`](docs/signin-experiment.md)**：
+**完整的判定方法与操作手册见 [`docs/signin-probe.md`](docs/signin-probe.md)**：
 
-| 步骤 | 内容 |
+| 档 | 内容 |
 | --- | --- |
-| 1 | 官方正常签到（拿成功响应全文 + 确认读回端点可用） |
-| 2 | 有效码 + **缺失** `captchaVerifyParam`（直接回答「是否强制」） |
-| 3 | 有效码 + **结构合法但伪造**的凭证（把参数层与人机层分开） |
-| 4 | 有效码 + **重放**同一个已用过的凭证（回答「是否一次性」） |
+| 1 | `check-code-analyze`（`a=0`，无人机凭证、无定位） |
+| 2 | `code-check-in`（无人机凭证、带定位） |
+| 3 | 有效码 + **缺失** `captchaVerifyParam`（直接回答「是否强制」） |
+| 4 | 有效码 + **结构合法但伪造**的凭证（把参数层与人机层分开） |
+| 5 | 有效码 + **官方 SDK 真值** → 库的 `SignIn`（验证库的封装路径） |
 
-单变量纪律（除该字段外逐字节沿用官方请求）、判读表、应急方案与脱敏规则都在那份手册里。
-这套实验的约束（为什么只能用真机、为什么不能在别的机器上发探针、为什么结论只作单边证据）
-见 [`docs/adr/0001-证据只能来自一次真实签到窗口.md`](docs/adr/0001-证据只能来自一次真实签到窗口.md)。
+预置清单、30 秒相位预算、写入闸门、读回判读表、脱敏规则、以及手机端
+（钉钉 + Reqable 上报服务器）要做的每一步，都在那份手册里。
+这套实验的约束与取舍——为什么允许从本机发探针、为什么本机失败只作弱证据、
+为什么继续排除模拟器——见
+[`docs/adr/0002-本机探针与浏览器取参的取舍.md`](docs/adr/0002-本机探针与浏览器取参的取舍.md)。
 
 ## 未覆盖的鉴权路径：钉钉免登
 
@@ -345,15 +350,24 @@ SKL_TOKEN=<localStorage.sessionId> go test -tags integration -run TokenOnly -v .
 单元测试用 `httptest` 搭了一个假的 skl 站点，覆盖 CAS 转发、SSO 登录页、
 CAS 回调与 token 下发，因此**整条登录链是可以离线测试的**。
 
-判定「人机验证是否强制」是一次性的现场实验，**不在测试套件里**：
-按 [`docs/signin-experiment.md`](docs/signin-experiment.md) 执行——抓包环境、
-单变量纪律、探针顺序、判读表与脱敏规则都写在那里，不要临场发挥。
+判定「人机验证是否强制」并验证库的签到封装路径是一次性的现场实验，
+**不在测试套件里**：按 [`docs/signin-probe.md`](docs/signin-probe.md) 执行——
+预置清单、30 秒相位预算、探针顺序、读回判读表、手机端操作与脱敏规则都写在那里，
+不要临场发挥。探针工具是 [`cmd/signinprobe`](cmd/signinprobe/main.go)：
+
+```bash
+export HDU_USER=2427xxxx HDU_PASS=...
+go run ./cmd/signinprobe            # 默认 headless、Reqable hook :8080、30s 预算
+```
 
 > ⚠️ **不要把真实数据写进代码或文档。** 本文库会公开，而抓包/真机调试很容易
 > 顺手把真实学号、姓名、手机号、**当时的 GPS 坐标**、以及**仍然有效的会话 token**
 > 粘进测试用例或文档示例。目前仓库里一律使用合成占位值
 > （学号 `24000000`、坐标 `30.123456,120.654321`、token `11111111-2222-...`）。
 > `*.har` 与 `.env` 已在 `.gitignore` 中屏蔽。
+>
+> 唯一例外是签到探针的默认围栏中心 `30.313816,120.343228`：它是**刻意写死的
+> 公开校园坐标**（功能常量，覆盖教学楼范围），不是从抓包里抄下来的个人定位。
 
 ## 合规
 

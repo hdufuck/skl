@@ -132,7 +132,7 @@ store，只在其它页面读到 `courseId`、`courseName`、`id`、`courseSchem
 > ⚠️ 人机验证是否**强制**无法用无效签到码证伪：签到码校验先于验证码，
 > 缺失/伪造/不传 `captchaVerifyParam` 都返回同一个
 > `401 {"code":0,"msg":"签到码不存在，不要玩我"}`。
-> 判定方法见 **[签到实验手册](./signin-experiment.md)**。
+> 判定方法见 **[签到探针手册](./signin-probe.md)**。
 
 📖 三条遗留路径在现行前端里的实际地位（全 bundle 级检索）：
 
@@ -329,7 +329,7 @@ store，只在其它页面读到 `courseId`、`courseName`、`id`、`courseSchem
 ## 5. 未证实与已知缺口
 
 > 下面这些项由 **[issue #1](https://github.com/hdufuck/skl/issues/1)** 跟踪，
-> 判定方法见 **[签到实验手册](./signin-experiment.md)**（只能用一次真实有效的签到码，
+> 判定方法见 **[签到探针手册](./signin-probe.md)**（只能用一次真实有效的签到码，
 > 一次窗口做完；采集与脱敏规则也在那里）。
 
 | 项 | 状态 |
@@ -365,6 +365,6 @@ SKL_TOKEN=<localStorage.sessionId> go test -tags integration -run TokenOnly -v .
 `200 + 空 body` 而误以为接口正常。签到类接口不要拿有效签到码试探——
 它会真的签到。
 
-要判定「人机验证是否强制」时，按 **[签到实验手册](./signin-experiment.md)** 执行：
+要判定「人机验证是否强制」时，按 **[签到探针手册](./signin-probe.md)** 执行：
 抓包环境、单变量纪律、探针顺序、判读表与脱敏规则都写在那里，
 不要临场发挥——那个窗口不可重复。

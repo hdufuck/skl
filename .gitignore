@@ -22,6 +22,9 @@ go.work.sum
 .token
 token.txt
 
+# 探针原始报告（含未脱敏 body，只提交人工脱敏后的片段）
+probe-results/
+
 # Editors / OS
 .DS_Store
 .idea/
