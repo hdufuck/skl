@@ -38,7 +38,7 @@ func integrationClient(t *testing.T) *Client {
 
 func TestIntegrationLogin(t *testing.T) {
 	c := integrationClient(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
 
 	if err := c.Login(ctx); err != nil {
@@ -63,7 +63,7 @@ func TestIntegrationTokenOnly(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 
 	user, err := c.UserInfo(ctx)
@@ -75,7 +75,7 @@ func TestIntegrationTokenOnly(t *testing.T) {
 
 func TestIntegrationReadOnlyEndpoints(t *testing.T) {
 	c := integrationClient(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
 
 	user, err := c.UserInfo(ctx)

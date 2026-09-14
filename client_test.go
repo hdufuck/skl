@@ -1,7 +1,6 @@
 package skl
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -24,6 +23,13 @@ type mockSkl struct {
 	Token string
 	// Business401Body 是业务性质 401 的响应体（不带 url 字段）。
 	Business401Body string
+
+	// JsapiTicketBody 为 /api/dingtalk/jsapi_ticket 的响应体。
+	// 留空则模拟抓包中观察到的 200 + 空 body。
+	JsapiTicketBody string
+
+	// AnalyzeJSONP 为 check-code-analyze 的 JSONP 响应模板（%s 替换为回调名）。
+	AnalyzeJSONP string
 
 	server *httptest.Server
 
@@ -116,6 +122,30 @@ func newMockSkl(t *testing.T) *mockSkl {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	mux.HandleFunc("/api/dingtalk/jsapi_ticket", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if m.JsapiTicketBody == "" {
+			// 与 HAR#2 一致：200 + 0 字节。
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = io.WriteString(w, m.JsapiTicketBody)
+	})
+
+	mux.HandleFunc("/api/ali-nvc/check-code-analyze", func(w http.ResponseWriter, r *http.Request) {
+		tpl := m.AnalyzeJSONP
+		if tpl == "" {
+			tpl = `%s({"result":{"code":800}})`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, tpl, r.URL.Query().Get("callback"))
+	})
+
+	mux.HandleFunc("/api/checkIn/code-check-in", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"code":0,"msg":"签到码不存在，不要玩我"}`)
+	})
+
 	mux.HandleFunc("/api/echo", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
 		m.tickets = append(m.tickets, r.Header.Get(HeaderTicket))
@@ -164,7 +194,7 @@ func TestLoginCapturesTokenFromRedirectFragment(t *testing.T) {
 	m := newMockSkl(t)
 	c := newMockClient(t, m)
 
-	if err := c.Login(context.Background()); err != nil {
+	if err := c.Login(t.Context()); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
 
@@ -173,7 +203,7 @@ func TestLoginCapturesTokenFromRedirectFragment(t *testing.T) {
 	}
 
 	// 登录后应能直接拿到用户信息，且不再触发二次登录。
-	user, err := c.UserInfo(context.Background())
+	user, err := c.UserInfo(t.Context())
 	if err != nil {
 		t.Fatalf("UserInfo: %v", err)
 	}
@@ -195,7 +225,7 @@ func TestLoginIsIdempotentWhenTokenStillValid(t *testing.T) {
 	c := newMockClient(t, m)
 
 	for i := range 3 {
-		if err := c.Login(context.Background()); err != nil {
+		if err := c.Login(t.Context()); err != nil {
 			t.Fatalf("Login #%d: %v", i, err)
 		}
 	}
@@ -216,7 +246,7 @@ func TestLoginWithoutCredentials(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	if err := c.Login(context.Background()); !errors.Is(err, ErrNoCredentials) {
+	if err := c.Login(t.Context()); !errors.Is(err, ErrNoCredentials) {
 		t.Fatalf("Login() = %v, want ErrNoCredentials", err)
 	}
 }
@@ -228,7 +258,7 @@ func TestDoAutoReloginOnAuthURL401(t *testing.T) {
 	c := newMockClient(t, m, WithToken("stale-token"))
 
 	// 带过期 token 请求 -> 401 带 url -> 自动重登 -> 重放成功。
-	user, err := c.UserInfo(context.Background())
+	user, err := c.UserInfo(t.Context())
 	if err != nil {
 		t.Fatalf("UserInfo: %v", err)
 	}
@@ -250,7 +280,7 @@ func TestDoDoesNotReloginOnBusiness401(t *testing.T) {
 	m.Business401Body = `{"code":0,"msg":"签到码不存在，不要玩我"}`
 	c := newMockClient(t, m, WithToken("whatever"))
 
-	resp, err := c.Get(context.Background(), "/api/business-401", nil)
+	resp, err := c.Get(t.Context(), "/api/business-401", nil)
 
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) {
@@ -282,7 +312,7 @@ func TestDoNoReloginWhenDisabled(t *testing.T) {
 	m := newMockSkl(t)
 	c := newMockClient(t, m, WithAutoLogin(false), WithToken("stale"))
 
-	_, err := c.Get(context.Background(), "/api/userinfo", nil)
+	_, err := c.Get(t.Context(), "/api/userinfo", nil)
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.AuthURL == "" {
 		t.Fatalf("err = %v, want *APIError with AuthURL", err)
@@ -305,7 +335,7 @@ func TestDoSendsFreshTicketPerRequest(t *testing.T) {
 
 	const n = 5
 	for range n {
-		if _, err := c.Get(context.Background(), "/api/echo", nil); err != nil {
+		if _, err := c.Get(t.Context(), "/api/echo", nil); err != nil {
 			t.Fatalf("echo: %v", err)
 		}
 	}
@@ -334,7 +364,7 @@ func TestDoEmptyBodyIsAnError(t *testing.T) {
 	m := newMockSkl(t)
 	c := newMockClient(t, m, WithToken(m.Token))
 
-	_, err := c.Get(context.Background(), "/api/empty", nil)
+	_, err := c.Get(t.Context(), "/api/empty", nil)
 	if !errors.Is(err, ErrEmptyBody) {
 		t.Fatalf("err = %v, want ErrEmptyBody", err)
 	}
@@ -346,7 +376,7 @@ func TestDoAllowEmptyBody(t *testing.T) {
 	m := newMockSkl(t)
 	c := newMockClient(t, m, WithToken(m.Token))
 
-	resp, err := c.Do(context.Background(), &Request{
+	resp, err := c.Do(t.Context(), &Request{
 		Method:         http.MethodGet,
 		Path:           "/api/empty",
 		AllowEmptyBody: true,
@@ -366,7 +396,7 @@ func TestDoSendsAuthTokenOnlyWhenPresent(t *testing.T) {
 
 	// 无 token：不应发送 X-Auth-Token 头。
 	c := newMockClient(t, m)
-	resp, err := c.Get(context.Background(), "/api/echo", nil)
+	resp, err := c.Get(t.Context(), "/api/echo", nil)
 	if err != nil {
 		t.Fatalf("echo: %v", err)
 	}
@@ -380,7 +410,7 @@ func TestDoSendsAuthTokenOnlyWhenPresent(t *testing.T) {
 
 	// 有 token：应发送。
 	c.SetToken("abc")
-	resp, err = c.Get(context.Background(), "/api/echo", nil)
+	resp, err = c.Get(t.Context(), "/api/echo", nil)
 	if err != nil {
 		t.Fatalf("echo: %v", err)
 	}

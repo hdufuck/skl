@@ -30,6 +30,54 @@
 // skl.hdu.edu.cn 在公网可直接访问，钉钉容器里走的也是直连。
 // 因此本包不依赖 webvpn 隧道，只在 SSO 登录环节复用 hduwebvpn 的 sso 包。
 //
+// # 证据来源（先读这一节，再看风险清单）
+//
+// 本包的事实来自三个相互独立、可信度不同的来源，文档中凡涉及“实测”
+// 的地方都指第 3 类：
+//
+//  1. 两份 Reqable 抓包（2026-09-14）。提供了：X-Auth-Token / skl-ticket
+//     两个头、/api/userinfo / /api/course / /api/dingtalk/jsapi_ticket
+//     等只读接口的响应、两次失败的签到（401「签到码不存在」）、
+//     以及阿里云验证码的相关域名与 SDK 版本 3.29.0。
+//  2. skl 前端构建产物（index-*.js / vendor-*.js / useAuthSession-*.js）。
+//     提供了：token 存在 localStorage.sessionId、skl-ticket = nanoid(21)、
+//     登录跳转契约、签到页调用 captcha-verify 的参数、遗留接口清单、
+//     以及验证码参数结构与场景常量。**不是**抓包证据。
+//  3. 真机验证（真实跑通的请求）。提供了：CAS/SSO 登录链、token 落在 URL
+//     fragment、skl-ticket 的一次性语义、各遗留接口的真实响应。
+//
+// **特别提醒：两份 HAR 里并不包含 skl 的 CAS 登录链。** 唯一的
+// `cas.hdu.edu.cn` 字样出现在 i.hdu.edu.cn 门户页里一段被注释掉的
+// `<script>` 里，与 skl 无关。skl 的登录链是先从 `/api/userinfo` 的 401
+// 契约与前端源码推导出来、再真机跑通的。
+//
+// # 未覆盖的鉴权路径：钉钉免登（exempt-login）
+//
+// HAR#2 里的“真实”SSO 流程是本包**没有实现**的另一条路，属于使用者确实
+// 需要知道的风险点：
+//
+//	GET /sso.hdu.edu.cn/clientredirect?client_name=dingDingWlan&service=..
+//	GET /sso.hdu.edu.cn/public/exempt-login/dingding.html
+//	    ?corpId=..&appid=..&open=true&response_type=code&scope=snsapi_auth
+//	GET /sso.hdu.edu.cn/login?code=<钉钉 OAuth code>&client_name=dingDingWlan
+//	  -> 302 ...&ticket=ST-..  （此例服务对象是 i.hdu.edu.cn，不是 skl）
+//
+// 这条路的 `code` 是钉钉开放平台在**应用内部**下发的 OAuth 授权码，
+// 服务器端再无“账号 + 密码”环节。因此：
+//
+//   - 包外无法复现：拿不到 code，也就无法用这条路登入；本包改为走
+//     账号密码的 CAS/SSO 表单，效果等价。
+//   - 如果学校哪天只保留免登、关闭密码登录，本包会失效。
+//
+// 同理，下面这些能力**不存在于网络层**，抓包不可能复现，
+// 本包也不提供，依赖它们的功能超出能力边界：
+//
+//   - 钉钉 JSAPI 桥（`dd.*`：`device.geolocation.get`、`biz.util.scan`、
+//     `biz.chat.*`）的结果。这是原生能力，不是可回放的 HTTP 调用。
+//   - 验证码 `data` / `deviceToken` 的**生成过程**。
+//     （它俩所依赖的 HTTP 调用在抓包里可见，但真正的设备指纹采集与
+//     签名在原生/SDK 内部完成。）
+//
 // # 最小用例
 //
 //	client, err := skl.NewClient(
@@ -58,13 +106,13 @@
 //
 // # 风险与未解项
 //
-// 以下内容按影响程度排序。前两条是「做不到 / 未能证实」的部分，
-// 其余是需要调用方知情的行为约束。
+// 以下内容按影响程度排序。“未覆盖的鉴权路径”一节（上面）也是风险的一部分，
+// 尤其是钉钉免登不可复现这一点。
 //
 // ## 1. 签到的人机验证无法用纯 Go 合成（最大的硬边界）
 //
 // `POST /api/ali-nvc/captcha-verify` 必须携带 `captchaVerifyParam`，
-// 该值由阿里云验证码 3.x 前端 SDK（抓包版本 3.29.0）生成：
+// 该值由阿里云验证码 3.x 前端 SDK（抓包版本 3.29.0）生成。
 //
 //	{"sceneId":"2q42bw25","certifyId":"..","deviceToken":"V0VCI2Fi..","data":"JRMlgg1E.."}
 //

@@ -34,8 +34,13 @@ type SignInRequest struct {
 
 // SignInResult 是 `POST /api/ali-nvc/captcha-verify` 的响应。
 //
-// 实测字段为 `captchaVerifyResult` 与 `checkCodeDto`；
-// 两者内部形态未逐字段实测，因此保持 RawMessage 透出。
+// 字段名 `captchaVerifyResult` / `checkCodeDto` 取自 skl 前端源码
+// （sign/in 页面读的是 `g.captchaVerifyResult` 与 `g.checkCodeDto`），
+// **不是** 抓包结论：两份 HAR 里的两次签到都返回
+// `401 {"code":0,"msg":"签到码不存在，不要玩我"}`，未观察到成功响应。
+// 因此两者内部形态保持 RawMessage 透出，未做字段级建模。
+//
+// 前端拿到 checkCodeDto 后存进 store 并跳转 /sign/in/detail。
 type SignInResult struct {
 	CaptchaVerifyResult json.RawMessage `json:"captchaVerifyResult"`
 	CheckCodeDto        json.RawMessage `json:"checkCodeDto"`
@@ -95,8 +100,10 @@ func (c *Client) SignIn(ctx context.Context, req SignInRequest) (*SignInResult, 
 
 // SignInLegacy 通过遗留接口 `GET /api/checkIn/code-check-in` 签到。
 //
-// 该接口在抓到的前端构建里已经没有调用方，属于历史遗留，
-// 但它依然可用，并且**不需要** captchaVerifyParam。
+// 该接口在抓到的前端构建里已经没有调用方（`index-BjaCUYRh.js` 仍把它注册为
+// `signIn()`，但已无页面调用），属于历史遗留。两份 HAR 中也**没有**出现
+// 该请求。我们用一个无效签到码实测过它：返回 401「签到码不存在，不要玩我」，
+// 说明服务端仍然在路由该接口，且它不需要 captchaVerifyParam。
 //
 // ⚠️ 风险（必读）：无法在没有人机验证的情况下验证「有效签到码」的语义。
 // 用无效签到码探测时它返回与 captcha-verify 完全相同的
@@ -171,6 +178,11 @@ func (r *AnalyzeResult) OK() bool {
 }
 
 // CaptchaRequired 报告服务端是否要求完成滑块验证。
+//
+// 判据是 `result.code == 400`。该语义取自前端分支（签到页的 onValid：
+// code 为 400 时调 `window.nvc.getNC()` 弹滑块）。
+// 注意实测只用无效签到码探测过该接口，得到的是 800，因此 400 分支
+// 本身**未经实测**。
 func (r *AnalyzeResult) CaptchaRequired() bool { return r != nil && r.Code == AnalyzeCodeCaptcha }
 
 // SignInLegacyAnalyze 通过遗留 JSONP 接口 `/api/ali-nvc/check-code-analyze` 签到。
@@ -179,6 +191,9 @@ func (r *AnalyzeResult) CaptchaRequired() bool { return r != nil && r.Code == An
 // 前端平时直接上报 `a=0`（表示未做人机验证），只有当服务端返回
 // AnalyzeCodeCaptcha 时才弹出滑块。这使它成为**最可能绕过人机验证**的路径，
 // 但同样无法在拿到有效签到码之前证伪（签到码校验先于风控判定）。
+//
+// 同 SignInLegacy：该接口在前端构建里已无调用方，两份 HAR 中也没有出现；
+// 我们用无效签到码实测过，返回 `{"result":{"code":800}}`。
 //
 // ⚠️ 同 SignInLegacy：传入有效签到码可能会直接签到成功。
 //

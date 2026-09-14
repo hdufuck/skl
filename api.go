@@ -32,7 +32,9 @@ const (
 	PathCaptchaImage        = "/api/checkIn/create-code-img"
 )
 
-// decodeJSON 校验业务错误后把响应体解析到 T。
+// decodeJSON 把响应体解析到 T。
+//
+// 业务错误已经由 Do/apiErrorFrom 处理，这里只负责反序列化。
 func decodeJSON[T any](resp *Response) (T, error) {
 	var out T
 	if err := resp.JSON(&out); err != nil {
@@ -90,17 +92,26 @@ func (c *Client) User(ctx context.Context) (*UserInfo, error) {
 //
 // 该接口只在钉钉容器内可用；非钉钉环境下也能调用成功，但返回的签名
 // 无法驱动任何 JSAPI（例如扫一扫、精确定位）。
+//
+// 注意：抓包显示该接口在钉钉容器里会返回 `200 + 空 body`
+// （HAR#2 中该请求响应体为 0 字节，同一账号在 HAR#1 里又返回了完整 JSON）。
+// 因此这里显式允许空 body，再把空票据翻译成一个带上下文的 ErrEmptyBody，
+// 而不是当成结构解析失败。
 func (c *Client) JsapiTicket(ctx context.Context, pageURL string) (*JsapiTicket, error) {
 	if pageURL == "" {
 		pageURL = c.baseURL + "/" + c.index
 	}
 	resp, err := c.Do(ctx, &Request{
-		Method: http.MethodGet,
-		Path:   PathJsapiTicket,
-		Query:  url.Values{"url": {pageURL}},
+		Method:         http.MethodGet,
+		Path:           PathJsapiTicket,
+		Query:          url.Values{"url": {pageURL}},
+		AllowEmptyBody: true,
 	})
 	if err != nil {
 		return nil, err
+	}
+	if resp.IsEmpty() {
+		return nil, fmt.Errorf("%w: %s 返回空 body", ErrEmptyBody, PathJsapiTicket)
 	}
 	ticket, err := decodeJSON[JsapiTicket](resp)
 	if err != nil {

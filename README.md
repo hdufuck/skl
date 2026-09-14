@@ -2,19 +2,26 @@
 
 杭电学勤系统（`skl.hdu.edu.cn`）的非官方 Go 客户端。
 
-从两份钉钉手机端 Reqable 抓包（2026-09-14）逆向并**真机验证**了鉴权链路，把
-会话获取、nonce 管理、以及 skl 特有的失败模式封装成可复用的 Go 包。
+从两份钉钉手机端 Reqable 抓包（2026-09-14）、skl 前端构建产物、以及**真机验证**三方
+交叉确认后，把会话获取、nonce 管理、以及 skl 特有的失败模式封装成可复用的 Go 包。
+
+> **证据来源提醒**：两份 HAR 里**不包含** skl 的 CAS 登录链
+> （唯一的 `cas.hdu.edu.cn` 字样出现在 i.hdu.edu.cn 门户页里被注释掉的 `<script>` 中），
+> 登录链是先从 `/api/userinfo` 的 401 契约与前端源码推导、再真机跑通的。
+> 哪些事实来自抓包、哪些来自前端源码、哪些来自真机验证，见
+> `doc.go` 的「证据来源」一节。
 
 ## 状态一览
 
 | 能力 | 状态 |
 | --- | --- |
-| CAS/SSO 登录 → session token | ✅ 真机验证 |
+| CAS/SSO 登录 → session token | ✅ 真机验证（非抓包） |
 | token 注入 / 持久化 / 401 自动重登 | ✅ 已验证 |
 | 只读接口（用户、课表、考勤统计、考核项） | ✅ 已验证 |
 | skl-ticket 一次性 nonce 语义 | ✅ 已验证 |
 | 签到（`captcha-verify`） | ⚠️ 协议已封装，但依赖阿里云验证码参数，见下 |
 | 签到（遗留无验证码路径） | ⚠️ 可调用，但语义未能证实 |
+| 钉钉免登（exempt-login）鉴权 | ❌ 未实现（需应用内 OAuth code） |
 | 钉钉 JSAPI（扫一扫、精确定位等） | ❌ 不在网络层，无法复现 |
 
 ## 鉴权模型
@@ -172,11 +179,36 @@ if result.CaptchaRequired() { /* 400：服务端要求滑块 */ }
 是「最可能不需要验证码」的路径（后者是阿里云 NVC 的风险自适应形态，
 前端平时直接上报 `a=0`），但同样无法在拿到有效签到码前证伪。
 
+## 未覆盖的鉴权路径：钉钉免登
+
+HAR#2 里会出现另一条 SSO 流程，本包**没有实现**：
+
+```text
+GET /sso.hdu.edu.cn/clientredirect?client_name=dingDingWlan&service=..
+GET /sso.hdu.edu.cn/public/exempt-login/dingding.html
+    ?corpId=..&appid=..&open=true&response_type=code&scope=snsapi_auth
+GET /sso.hdu.edu.cn/login?code=<钉钉 OAuth code>&client_name=dingDingWlan
+  -> 302 ...&ticket=ST-..
+```
+
+这条路的 `code` 是钉钉开放平台在**应用内部**下发的 OAuth 授权码，服务端没有
+账号密码环节，包外无法复现（拿不到 code）。本包改为走账号密码的
+CAS/SSO 表单，效果等价。**但如果学校改成只保留免登、关闭密码登录，本包会失效。**
+
+同理，下面这些能力**不存在于网络层**，抓包不可能复现：
+
+- 钉钉 JSAPI 桥（`dd.*`：`device.geolocation.get`、`biz.util.scan`、`biz.chat.*`）。
+- 验证码 `data` / `deviceToken` 的生成过程（其依赖的 HTTP 调用在抓包里可见，
+  但真正的设备指纹采集与签名在原生/SDK 内部完成）。
+
 ## 其它已实测的行为约束
 
 - **`skl-ticket` 是一次性 nonce。** 重放会得到 `HTTP 200 + 空 body`
   ——失败不能用状态码判断。本包把这种情况翻译成 `ErrEmptyBody`。
   重试请求时必须重新构造 `Request`，不要复用。
+- **`/api/dingtalk/jsapi_ticket` 会合法地返回空 body。** HAR#2 里该请求就是
+  200 + 0 字节（同一账号在 HAR#1 里返回了完整 JSON）。`JsapiTicket()` 因此
+  显式允许空 body，并把它翻译成带上下文的 `ErrEmptyBody`，而不是解析失败。
 - **存在前置 WAF/限流。** 除 nonce 重放外还观察到符合「被拦截」特征的
   200+空 body。把 `ErrEmptyBody` 当作需要退避的信号，不要立刻重试。
 - **401 有双重语义。** 会话失效与业务校验失败（如「签到码不存在」）
@@ -193,7 +225,8 @@ if result.CaptchaRequired() { /* 400：服务端要求滑块 */ }
 
 ## 已探明的 API 面
 
-前端 `index-BjaCUYRh.js` 里注册的全部端点（本包已类型化的标注 ✅）：
+前端 `index-BjaCUYRh.js` 里注册的全部端点（本包已类型化的标注 ✅）。
+注意：这张表来自**前端构建产物**，其中大部分并未出现在两份 HAR 里。
 
 | 域 | 端点 |
 | --- | --- |

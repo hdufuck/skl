@@ -42,9 +42,6 @@ func tokenFromRawURL(rawURL string) string {
 	return ""
 }
 
-// TokenFromRawURL 提取并返回 URL 中的 skl 会话 token（导出版本，便于测试与二次开发）。
-func TokenFromRawURL(rawURL string) string { return tokenFromRawURL(rawURL) }
-
 // fragmentQuery 把 URL fragment 归一化成 query string。
 //
 // fragment 可能是 `?token=x`、`token=x` 或 `/path?token=x`，

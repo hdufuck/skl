@@ -16,20 +16,23 @@ var (
 	// ErrLoginFailed 表示 CAS/SSO 登录流程结束但未取得可用的 session token。
 	ErrLoginFailed = errors.New("skl: CAS 登录失败，未取得可用的 session token")
 
-	// ErrUnauthorized 表示会话失效（401）。调用方通常应先 Login 再重试。
-	ErrUnauthorized = errors.New("skl: 会话失效")
+	// ErrUnauthorized 表示响应状态码为 401。
+	//
+	// 注意它**不**等价于「会话失效」：skl 也用 401 表达业务校验失败
+	// （例如「签到码不存在」）。要判断是否需要重新登录，用
+	// APIError.NeedLogin()。
+	ErrUnauthorized = errors.New("skl: HTTP 401")
 
 	// ErrEmptyBody 表示服务端返回 `HTTP 200` 但响应体为空。
 	//
-	// 这是 skl 一个非常容易踩坑的失败模式，实测由两类原因触发：
-	//  1. skl-ticket 被重放（服务端把它当作一次性 nonce）；
-	//  2. 请求被前置 WAF 拦截。
+	// 这是 skl 一个非常容易踩坑的失败模式。已证实的一种触发原因是
+	// skl-ticket 被重放（服务端把它当作一次性 nonce）；另外还观察到
+	// 符合「被前置 WAF 拦截」特征的同类响应。
 	//
 	// 注意它**不是** 4xx/5xx，因此不能靠状态码判断成功。
+	// 例外：`/api/dingtalk/jsapi_ticket` 在钉钉容器里会合法地返回
+	// 200+空 body（见 JsapiTicket 的文档）。
 	ErrEmptyBody = errors.New("skl: 服务端返回 200 但响应体为空（skl-ticket 重放被拒或被 WAF 拦截）")
-
-	// ErrCaptchaRequired 表示服务端要求完成人机验证。
-	ErrCaptchaRequired = errors.New("skl: 服务端要求人机验证")
 
 	// ErrNoCaptchaProvider 表示需要 captchaVerifyParam 但未配置 CaptchaProvider。
 	ErrNoCaptchaProvider = errors.New("skl: 未配置 CaptchaProvider，无法获取 captchaVerifyParam")
@@ -73,8 +76,6 @@ func (e *APIError) Is(target error) bool {
 	switch target {
 	case ErrUnauthorized:
 		return e.StatusCode == http.StatusUnauthorized
-	case ErrCaptchaRequired:
-		return e.CaptchaRequired()
 	default:
 		return false
 	}
@@ -91,13 +92,3 @@ func (e *APIError) Is(target error) bool {
 func (e *APIError) NeedLogin() bool {
 	return e.AuthURL != ""
 }
-
-// CaptchaRequired 报告该错误是否意味着服务端要求人机验证。
-//
-// 实测形态：`check-code-analyze` 通过 JSONP 返回 `{"result":{"code":400}}`，
-// 前端据此弹出滑块。这里只做保守判断，不猜测其它错误码语义。
-func (e *APIError) CaptchaRequired() bool {
-	return e.StatusCode == http.StatusBadRequest && e.Msg == captchaRequiredMsg
-}
-
-const captchaRequiredMsg = "请完成人机验证"
