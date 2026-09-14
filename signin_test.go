@@ -3,7 +3,9 @@ package skl
 import (
 	"context"
 	"errors"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -228,7 +230,7 @@ func TestSignInUsesCaptchaProvider(t *testing.T) {
 		})),
 	)
 
-	// 服务端会返回业务 401（签到码不存在），关键是它把 provider 的值带上了。
+	// 服务端会返回业务 401（签到码不存在），关键是 provider 的值确实被带上了。
 	_, err := c.SignIn(t.Context(), SignInRequest{
 		Code: "1212", Latitude: 30.123456, Longitude: 120.654321,
 	})
@@ -236,9 +238,55 @@ func TestSignInUsesCaptchaProvider(t *testing.T) {
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("err = %v, want *APIError", err)
 	}
-	if !strings.Contains(apiErr.Body, "captchaVerifyParam") &&
-		!strings.Contains(apiErr.Body, "签到码") {
-		t.Logf("响应体（说明请求已到达业务逻辑）: %s", apiErr.Body)
+
+	m.mu.Lock()
+	sent := m.lastCaptchaVerifyQuery.Get("captchaVerifyParam")
+	m.mu.Unlock()
+	if sent != `{"sceneId":"2q42bw25"}` {
+		t.Fatalf("provider 产出的 captchaVerifyParam 未被发送，实际 = %q", sent)
+	}
+}
+
+// captcha-verify 是学生签到的★主路径，参数集必须稳定：
+// captchaVerifyParam / code / latitude / longitude / t / userid。
+// 多一个少一个都可能改变服务端行为，所以逐字锁定。
+func TestSignInSendsExactCaptchaVerifyParamSet(t *testing.T) {
+	t.Parallel()
+
+	m := newMockSkl(t)
+	c := newMockClient(t, m,
+		WithToken(m.Token),
+		WithCaptchaProvider(StaticCaptchaProvider{Value: `{"sceneId":"2q42bw25"}`}),
+	)
+
+	_, err := c.SignIn(t.Context(), SignInRequest{
+		Code: "1212", Latitude: 30.123456, Longitude: 120.654321,
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+
+	m.mu.Lock()
+	got := m.lastCaptchaVerifyQuery
+	m.mu.Unlock()
+
+	want := []string{"captchaVerifyParam", "code", "latitude", "longitude", "t", "userid"}
+	if keys := slices.Sorted(maps.Keys(got)); !slices.Equal(keys, want) {
+		t.Fatalf("参数集 = %v, want %v", keys, want)
+	}
+	if got.Get("code") != "1212" {
+		t.Fatalf("code = %q", got.Get("code"))
+	}
+	// userid 未显式提供时应自动取自 /userinfo。
+	if got.Get("userid") != "24000000" {
+		t.Fatalf("userid = %q, want 24000000（应自动解析）", got.Get("userid"))
+	}
+	if got.Get("latitude") != "30.123456" || got.Get("longitude") != "120.654321" {
+		t.Fatalf("定位 = %q,%q", got.Get("latitude"), got.Get("longitude"))
+	}
+	if got.Get("t") == "" {
+		t.Fatal("t 未发送")
 	}
 }
 

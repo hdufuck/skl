@@ -31,10 +31,12 @@ type mockSkl struct {
 	// AnalyzeJSONP 为 check-code-analyze 的 JSONP 响应模板（%s 替换为回调名）。
 	AnalyzeJSONP string
 
-	// lastAnalyzeQuery / lastCodeCheckInQuery 记录签到类接口收到的 query，
-	// 用于断言“遗留路径不上报定位”这类参数集不变式。
+	// lastAnalyzeQuery / lastCodeCheckInQuery / lastCaptchaVerifyQuery 记录签到类接口
+	// 收到的 query，用于断言参数集不变式。
 	lastAnalyzeQuery     url.Values
 	lastCodeCheckInQuery url.Values
+	// lastCaptchaVerifyQuery 记录 ★ 接口 POST /api/ali-nvc/captcha-verify 的 query。
+	lastCaptchaVerifyQuery url.Values
 
 	server *httptest.Server
 
@@ -135,6 +137,17 @@ func newMockSkl(t *testing.T) *mockSkl {
 			return
 		}
 		_, _ = io.WriteString(w, m.JsapiTicketBody)
+	})
+
+	// ★ 学生签到接口。真实的无效签到码会得到 401 业务错误。
+	mux.HandleFunc("/api/ali-nvc/captcha-verify", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		m.lastCaptchaVerifyQuery = r.URL.Query()
+		m.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"code":0,"msg":"签到码不存在，不要玩我"}`)
 	})
 
 	mux.HandleFunc("/api/ali-nvc/check-code-analyze", func(w http.ResponseWriter, r *http.Request) {

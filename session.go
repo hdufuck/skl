@@ -13,7 +13,7 @@ const SessionTokenParam = "token"
 //
 // skl 的会话 token 由 CAS 回调后重定向带回，实测落在 **URL fragment**：
 //
-//	https://skl.hdu.edu.cn/index.html#?token=11111111-...-b5dd82281598&t=1700000000001
+//	https://skl.hdu.edu.cn/index.html#?token=11111111-2222-4333-8444-555555555555&t=1700000000001
 //
 // 前端也兼容 query 形式与 hash 路由形式，因此这里两种都认：
 //
