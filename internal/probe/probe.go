@@ -433,6 +433,18 @@ func MaskID(id string) string {
 	return id[:4] + strings.Repeat("*", len(id)-4)
 }
 
+// MaskName 只留姓氏，其余一律打成两个星号。
+//
+// 按 rune 处理，不会把中文名字切成乱码；星号数量固定，不额外泄露名字有几个字。
+// 脚本只打这一处姓名（登录成功那条日志），报告里本来就只写打码后的学号。
+func MaskName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	return string([]rune(name)[0]) + "**"
+}
+
 var (
 	// 会话凭据在响应体里可能以 JSON 字段或 query 形态出现，落盘到 markdown 前一律抹掉。
 	redactJSONFieldRe  = regexp.MustCompile(`(?i)("(?:token|sessionid|x-auth-token|skl-ticket)"\s*:\s*")[^"]*(")`)

@@ -122,7 +122,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("读取用户信息失败（token 可能已失效，且没有可用的账号密码重新登录）: %w", err)
 	}
-	logf("已登录：%s（%s）", user.UserName, probe.MaskID(user.ID))
+	logf("已登录：%s（%s）", probe.MaskName(user.UserName), probe.MaskID(user.ID))
 
 	baseline, err := probe.ReadBackToday(client)(loginCtx)
 	if err != nil {

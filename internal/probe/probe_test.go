@@ -251,6 +251,26 @@ func TestMaskID(t *testing.T) {
 	}
 }
 
+// 测试数据一律用虚构姓名：真名不进仓库。
+func TestMaskName(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"张三丰", "张**"},
+		{"欧阳修文", "欧**"}, // 复姓也只留第一个字
+		{"张三", "张**"},
+		{"李", "李**"}, // 单字名同样不露出长度
+		{"Li Hua", "L**"},
+		{"  张三丰  ", "张**"},
+		{"", ""},
+	}
+	for _, tc := range tests {
+		if got := MaskName(tc.in); got != tc.want {
+			t.Errorf("MaskName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestSnapshotDiff(t *testing.T) {
 	before := SnapshotFromRaw([]json.RawMessage{
 		json.RawMessage(`{"id":"a","x":1}`),
