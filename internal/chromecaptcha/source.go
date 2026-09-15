@@ -34,6 +34,11 @@ const pageURL = "https://skl.hdu.edu.cn/index.html"
 // defaultChromePath 是 macOS 上 Chrome 的常见位置。
 const defaultChromePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
+// clickRetryAfter 是「点了没反应就补点一次」的等待阈值。
+//
+// 正常情况点击后 100–200ms 就有参数，所以 3s 还没出基本等于这次点击丢了。
+const clickRetryAfter = 3 * time.Second
+
 // Options 配置浏览器来源。
 type Options struct {
 	// ChromePath 是浏览器可执行文件；为空时依次尝试 $CHROME、常见路径。
@@ -49,6 +54,13 @@ type Options struct {
 	StartupTimeout time.Duration
 	// Logf 是可选的日志输出。
 	Logf func(format string, args ...any)
+
+	// Fulfill 让调用方在真实源下额外接管某些 URL 的响应体（返回 false 表示放行）。
+	//
+	// 生产路径不需要它。离线测试用它把官方 SDK 脚本换成桩，从而不依赖阿里云 CDN
+	// 也能走完「预热 → 点触发 → 取参」的真实链路。返回值是明文，内部按 CDP 要求
+	// 做 base64。
+	Fulfill func(rawURL string) (contentType, body string, ok bool)
 }
 
 // Source 是一个已预热、随时可取参的浏览器来源。
@@ -60,6 +72,7 @@ type Source struct {
 	trigger string
 	timeout time.Duration
 	logf    func(format string, args ...any)
+	fulfill func(rawURL string) (contentType, body string, ok bool)
 
 	mu        sync.Mutex
 	fromNet   string
@@ -123,6 +136,7 @@ func New(ctx context.Context, opts Options) (*Source, error) {
 
 	html := renderPage(opts.SceneID, opts.Prefix)
 	body := base64.StdEncoding.EncodeToString([]byte(html))
+	s.fulfill = opts.Fulfill
 
 	chromedp.ListenTarget(pageCtx, func(ev any) {
 		switch e := ev.(type) {
@@ -144,23 +158,35 @@ func New(ctx context.Context, opts Options) (*Source, error) {
 		}
 	})
 
-	readyCtx, cancelReady := context.WithTimeout(pageCtx, opts.StartupTimeout)
-	defer cancelReady()
+	// 首次 Run 必须直接跑在 pageCtx（浏览器自己的生命周期 ctx）上。
+	//
+	// chromedp 用 exec.CommandContext(ctx) 启动 Chrome：谁取消了这个 ctx，谁就杀掉
+	// 整个浏览器。所以启动预算**不能**表达成「挂在首次 Run 上的子 ctx」——那样
+	// New 一返回（defer cancel 释放预算）浏览器就没了，之后每一档都只能拿到
+	// context canceled（真值档恒为 transport_error）。
+	//
+	// 预算改由看门狗施加：超时才 Close，让 Run 以 ctx 取消的方式结束。
+	watchdog := time.AfterFunc(opts.StartupTimeout, func() {
+		opts.Logf("chromecaptcha: 启动预算 %s 用尽，关闭浏览器", opts.StartupTimeout)
+		_ = s.Close()
+	})
+	defer watchdog.Stop()
 
-	if err := chromedp.Run(readyCtx,
+	if err := chromedp.Run(pageCtx,
 		fetch.Enable().WithPatterns([]*fetch.RequestPattern{
 			{URLPattern: "*", RequestStage: fetch.RequestStageRequest},
 		}),
 		chromedp.Navigate(pageURL),
 	); err != nil {
-		s.Close()
+		_ = s.Close()
 		return nil, fmt.Errorf("chromecaptcha: 加载极简页失败: %w", err)
 	}
 
-	if err := s.waitReady(readyCtx); err != nil {
-		s.Close()
+	if err := s.waitReady(pageCtx); err != nil {
+		_ = s.Close()
 		return nil, err
 	}
+	watchdog.Stop()
 	opts.Logf("chromecaptcha: 官方验证码 SDK 已就绪（sceneId=%s prefix=%s）", opts.SceneID, opts.Prefix)
 	return s, nil
 }
@@ -178,26 +204,38 @@ func (s *Source) handlePaused(e *fetch.EventRequestPaused, body string) {
 	exec := cdp.WithExecutor(s.ctx, target.Target)
 
 	if strings.HasPrefix(e.Request.URL, pageURL) {
-		rid := e.RequestID
-		go func() {
-			err := fetch.FulfillRequest(rid, 200).
-				WithResponseHeaders([]*fetch.HeaderEntry{
-					{Name: "Content-Type", Value: "text/html; charset=utf-8"},
-				}).
-				WithBody(body).
-				Do(exec)
-			if err != nil {
-				s.logf("chromecaptcha: 交付极简页失败: %v", err)
-			}
-		}()
+		s.fulfillAsync(exec, e.Request.URL, e.RequestID, "text/html; charset=utf-8", body)
 		return
+	}
+
+	if s.fulfill != nil {
+		if contentType, raw, ok := s.fulfill(e.Request.URL); ok {
+			s.fulfillAsync(exec, e.Request.URL, e.RequestID, contentType,
+				base64.StdEncoding.EncodeToString([]byte(raw)))
+			return
+		}
 	}
 
 	rid := e.RequestID
 	go func() { _ = fetch.ContinueRequest(rid).Do(exec) }()
 }
 
-// waitReady 等待页面上的 SDK 初始化标志。
+// fulfillAsync 交付一个响应体。body 需已 base64 编码（CDP 的要求）。
+func (s *Source) fulfillAsync(ctx context.Context, rawURL string, rid fetch.RequestID, contentType, body string) {
+	go func() {
+		err := fetch.FulfillRequest(rid, 200).
+			WithResponseHeaders([]*fetch.HeaderEntry{
+				{Name: "Content-Type", Value: contentType},
+			}).
+			WithBody(body).
+			Do(ctx)
+		if err != nil {
+			s.logf("chromecaptcha: 交付 %s 失败: %v", rawURL, err)
+		}
+	}()
+}
+
+// waitReady 等待页面上的就绪标志（由 `getInstance` 置位）：等到它才算「可以点了」。
 func (s *Source) waitReady(ctx context.Context) error {
 	deadline := time.Now().Add(s.timeout)
 	for {
@@ -247,9 +285,15 @@ func (s *Source) Param(ctx context.Context) (string, error) {
 	_ = chromedp.Run(bctx, chromedp.Evaluate(`window.__captchaVerifyParam = ""; true`, nil))
 
 	// 受信任点击（Input.dispatchMouseEvent），不是 JS 合成事件。
-	if err := chromedp.Run(bctx, chromedp.Click(s.trigger, chromedp.ByQuery)); err != nil {
+	if err := s.click(bctx); err != nil {
 		return "", fmt.Errorf("chromecaptcha: 触发验证码失败: %w", err)
 	}
+
+	// 实测：就绪之后点击 → 100–200ms 出参。若过了 clickRetryAfter 还没出，多半是
+	// 这一次点击落在 SDK 绑定处理器之前被杀掉了（风控 SDK 的初始化是异步的），
+	// 补点一次。只补一次：既不把预算耗在连点上，也少一分被判 F024 的风险。
+	retryAt := time.Now().Add(clickRetryAfter)
+	retried := false
 
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -257,12 +301,24 @@ func (s *Source) Param(ctx context.Context) (string, error) {
 		if p := s.readParam(bctx); p != "" {
 			return p, nil
 		}
+		if !retried && time.Now().After(retryAt) {
+			retried = true
+			s.logf("chromecaptcha: 点击后 %s 仍未出参，补点一次", clickRetryAfter)
+			if err := s.click(bctx); err != nil {
+				return "", fmt.Errorf("chromecaptcha: 触发验证码失败: %w", err)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return "", fmt.Errorf("chromecaptcha: 等待 captchaVerifyParam 超时: %w", ctx.Err())
 		case <-ticker.C:
 		}
 	}
+}
+
+// click 用受信任的 CDP 输入事件点一次触发按钮。
+func (s *Source) click(ctx context.Context) error {
+	return chromedp.Run(ctx, chromedp.Click(s.trigger, chromedp.ByQuery))
 }
 
 // browserContext 把调用方的 deadline / 取消叠加到浏览器 context 上。
@@ -333,11 +389,18 @@ func renderPage(sceneID, prefix string) string {
         return { captchaResult: true, bizResult: true };
       },
       onBizResultCallback: function () { window.__bizResult = true; },
-      getInstance: function () { window.__instance = true; },
+      // getInstance 是 SDK 把「构造完成的实例」交回来的时刻：它在 init / bindEvents
+      // 之后才回调（实测 init 后 300–550ms）。**只有到这时触发按钮才真正绑上点击
+      // 处理**，更早的点击会被直接丢掉（表现为点了没反应、取参一路超时，真值档
+      // 于是退化成 transport_error）。就绪标志必须在这里置位，不能像以前那样在
+      // initAliyunCaptcha 返回后同步置位。
+      getInstance: function (instance) {
+        window.__captchaInstance = instance;
+        window.__sdkReady = true;
+      },
       slideStyle: { width: 360, height: 50 },
       language: "cn"
     });
-    window.__sdkReady = true;
   } catch (e) { window.__sdkErr = "" + e; }
 })();
 </script>

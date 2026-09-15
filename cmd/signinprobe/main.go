@@ -257,10 +257,20 @@ func run() error {
 
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprint(os.Stderr, rep.Summary())
+	if len(rep.Notes) > 0 {
+		fmt.Fprintln(os.Stderr)
+		for _, note := range rep.Notes {
+			fmt.Fprintf(os.Stderr, "备注：%s\n", note)
+		}
+	}
 	fmt.Fprintf(os.Stderr, "\n原始报告（含未脱敏 body，已 gitignore）: %s\n", jsonPath)
 	fmt.Fprintf(os.Stderr, "脱敏草稿（人工确认后并入 docs/）: %s\n", mdPath)
 	if rep.WrittenWithoutCaptcha() {
 		fmt.Fprintln(os.Stderr, "结论：出现了「未用真凭证却写入记录」的档位 ⟹ 该路径不强制人机验证。")
+	}
+	if rep.GenuineUnproven() {
+		fmt.Fprintln(os.Stderr, "⚠ 真值档是 transport_error：请求根本没发出去，浏览器取参链路未走通。"+
+			"不要采信第 5 档的任何结论；先用无效码重跑演练（可加 --headed）把链路跑通。")
 	}
 	if rep.HookMissing {
 		fmt.Fprintln(os.Stderr, "提示：未收到手机 HAR 上报。检查手机 Reqable 的上报服务器配置与局域网连通性；原始抓包仍可在 Reqable 里人工补。")

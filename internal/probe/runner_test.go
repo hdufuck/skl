@@ -405,6 +405,55 @@ func TestRunPhoneHook(t *testing.T) {
 			t.Fatalf("应标记 hookMissing: %+v", rep)
 		}
 	})
+
+	// 手机端停在旧签到页时会带回上一个码：那次 401 与本次窗口无关，不能被
+	// 当成「官方权威对照」。
+	t.Run("手机端签到码与本次不一致", func(t *testing.T) {
+		client, rec, _ := newTestClient(t, newBackend())
+		ch := make(chan Entry, 1)
+		ch <- Entry{
+			Rung:   "phone",
+			URL:    "https://skl.hdu.edu.cn/api/ali-nvc/captcha-verify?userid=24270001&code=5888&t=1789410733678",
+			Status: 401,
+			Body:   codeRejectedBody,
+		}
+
+		cfg := baseConfig(client, rec)
+		cfg.SkipGenuine = true
+		cfg.Hook = ch
+
+		rep, err := Run(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		joined := strings.Join(rep.Notes, " | ")
+		if !strings.Contains(joined, "5888") || !strings.Contains(joined, "1234") {
+			t.Fatalf("签到码不一致应记备注，实际备注: %q", joined)
+		}
+	})
+
+	t.Run("手机端签到码与本次一致", func(t *testing.T) {
+		client, rec, _ := newTestClient(t, newBackend())
+		ch := make(chan Entry, 1)
+		ch <- Entry{
+			Rung:   "phone",
+			URL:    "https://skl.hdu.edu.cn/api/ali-nvc/captcha-verify?userid=24270001&code=1234&t=1789410733678",
+			Status: 401,
+			Body:   codeRejectedBody,
+		}
+
+		cfg := baseConfig(client, rec)
+		cfg.SkipGenuine = true
+		cfg.Hook = ch
+
+		rep, err := Run(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if joined := strings.Join(rep.Notes, " | "); strings.Contains(joined, "不能当对照") {
+			t.Fatalf("签到码一致不应报不一致，实际备注: %q", joined)
+		}
+	})
 }
 
 func TestRunRetriesOnEmptyBody(t *testing.T) {

@@ -215,6 +215,9 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 				phone := e
 				phone.FromPhone = true
 				rep.PhoneHAR = &phone
+				if note := phoneCodeNote(&phone, cfg.Code); note != "" {
+					rep.Notes = append(rep.Notes, note)
+				}
 			} else {
 				rep.HookMissing = true
 			}
@@ -226,6 +229,22 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 	}
 
 	return rep, nil
+}
+
+// phoneCodeNote 检查手机端上报的签到码与本次是否一致。
+//
+// 手机端若停在旧签到页（输入框里还是上一个码），它上报回来的 401 与本次窗口无关，
+// 拿它当「权威官方样本」作对照就是错的。URL 里的 `code` 不脱敏（见 RedactURL）。
+func phoneCodeNote(phone *Entry, want string) string {
+	u, err := url.Parse(phone.URL)
+	if err != nil {
+		return ""
+	}
+	got := u.Query().Get("code")
+	if got == "" || got == want {
+		return ""
+	}
+	return fmt.Sprintf("手机端上报的签到码是 %s，与本次的 %s 不同 ⟹ 那不是同一个窗口，不能当对照（请在手机签到页重新输入本次的码）", got, want)
 }
 
 // runRung 执行一档探针并组装记录。

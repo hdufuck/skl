@@ -117,7 +117,10 @@ const R = async a => {
 | headless + 默认 UA（未伪装） | `TRACELESS` | ✅ len≈1694 |
 
 三次独立运行全部 `TRACELESS`，`navigator.webdriver=false`。
-⟹ **没有滑块**；但 `initAliyunCaptcha` 只做初始化，**必须点一次触发按钮**才有参数 ✅。
+⟹ **没有滑块**；但 `initAliyunCaptcha` 只做初始化，**必须点一次触发按钮**才有参数 ✅；
+而且必须等 **`getInstance` 回调**（SDK 把构造完成的实例交回来，实测 init 后
+300–550ms）之后才能点——更早的点击会被直接丢掉（不是「没反应」，而是那时按钮上
+根本没有点击处理器）✅。
 
 风险 ⚠️：`TRACELESS` 是风控评分结果，会随 IP/时间/频次/设备指纹变化；
 阿里云有 `F024`「检测到自动化脚本模拟点击、滑动」，自动点击理论上可命中。
@@ -211,9 +214,13 @@ const R = async a => {
 6. **演练**：用**无效**签到码完整跑一遍脚本，确认
    - 读回端点能解析（打印出「读回预热成功」）；
    - 档 1–4 都在 8s 内返回 `401 签到码不存在`；
-   - 浏览器预热成功（打印「官方验证码 SDK 已就绪」）；
+   - **档 5 也拿到了 HTTP 状态**（无效码同样是 `401 签到码不存在`）——
+     只看到「官方验证码 SDK 已就绪」不算通过：那条日志只证明预热成功，
+     不证明 `New` 返回之后浏览器还活着；
    - 手机上报能在 10s 内到达（`hookMissing` 为 false）。
    演练会实际发出探针请求，但无效签到码不会写入任何记录。
+   档 5 若是 `transport_error`，脚本会额外打印
+   「⚠ 真值档是 transport_error：请求根本没发出去」，照它修链路再进窗口。
 
 ### 4.2 T0 流程
 
@@ -329,6 +336,18 @@ T0 后的时序：
 
 **踩坑**：
 
+- chromedp 用 `exec.CommandContext(ctx)` 起 Chrome，**首次 `chromedp.Run` 的 ctx
+  就是浏览器的生命周期**：把它挂在一个带超时的子 ctx 上、再在 `New` 返回时
+  `defer cancel()`，浏览器会在预热成功的那一刻被杀掉，之后每次取参都只能拿到
+  `触发验证码失败: context canceled`（真值档退化成 `transport_error`）。
+  启动预算要用看门狗（超时才 `Close`）表达，首次 Run 必须直接跑在浏览器自己的
+  ctx 上；反过来，`Param` 那层的 rung 预算取消的是子 ctx，不会连带杀掉浏览器。
+- `initAliyunCaptcha` 返回 ≠ 可以点：SDK 是在 `init`/`bindEvents` 之后才通过
+  `getInstance` 把实例交回来的（实测 init 后 300–550ms）。就绪标志必须挂在
+  `getInstance` 上；挂在 `initAliyunCaptcha` 返回之后，T0 后的第一次点击会落在
+  空处，真值档一路超时、退化成 `transport_error`（演练表格里就是一个「-」）。
+  `Param` 另有「3s 没出参就补点一次」的兜底。
+- 反过来，**就绪之后点击很快**：实测等 `getInstance` 再点，100–200ms 就出参。
 - `ListenTarget` 回调是**同步**执行的，里面必须另起 goroutine 发 CDP 命令，否则死锁；
 - `initAliyunCaptcha` 只做初始化，**不点触发按钮永远没有参数**；
 - 当前 cdproto 的 `network.Request` 已无 `PostData` 字段（改 `PostDataEntries`），
@@ -355,4 +374,7 @@ T0 后的时序：
 | hook 截获 | 临时 chromedp 程序 | `__captchaHookOk=true`，参数 len≈1690 |
 | 形态判定 | 同上，headless | `TRACELESS` ×3，`webdriver=false` |
 | 网络事件 | 临时 chromedp 程序 | `EventRequestWillBeSent.URL` 含完整 query |
+| 演练回归 | `internal/chromecaptcha/browser_test.go` | 首次 Run 的 ctx 即浏览器生命周期（启动预算改用看门狗）；就绪信号必须是 `getInstance`。桩 SDK 离线复刻真实时序，`New` → `Param` 全链路可测 |
+| 就绪信号 | `internal/chromecaptcha/integration_test.go` | `getInstance` ≈ init 后 300–550ms；等它再点，100–200ms 出参（3/3），且每次参数都是现取的（指纹/certifyId 各不相同） |
+| 端到端演练 | `internal/probe/signinprobe_integration_test.go` | 真浏览器取参 + 假服务端：真值档拿到 HTTP 401（1.5s），不再是 `transport_error` |
 | 依赖 | `go build` / `CGO_ENABLED=0` | 纯 Go，静态二进制 |

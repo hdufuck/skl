@@ -78,6 +78,20 @@ func (r *Report) Successes() []RungID {
 	return out
 }
 
+// GenuineUnproven 报告真值档是否连请求都没发出去。
+//
+// 判据就是 transport_error：它说明浏览器取参链路没走通（浏览器/上下文被提前关掉、
+// SDK 没出参、点击落空等），此时第 5 档对「库的 SignIn 封装路径能否走通」没给出
+// 任何证据——不要把它当成「真值档失败」，它根本没跑起来。
+func (r *Report) GenuineUnproven() bool {
+	for _, e := range r.Entries {
+		if e.Rung == RungCaptchaGenuine {
+			return e.Verdict == VerdictTransportError
+		}
+	}
+	return false
+}
+
 // Summary 渲染一张控制台速览表。
 func (r *Report) Summary() string {
 	var b strings.Builder
@@ -129,6 +143,16 @@ func (r *Report) Markdown() string {
 
 	if r.WrittenWithoutCaptcha() {
 		b.WriteString("> **强证据**：出现了「未携带真凭证却写入考勤记录」的档位 ⟹ 服务端在该路径上**不强制**人机验证。\n\n")
+	}
+	if r.GenuineUnproven() {
+		b.WriteString("> **真值档未验证**：`captcha-verify-genuine` 判为 `transport_error`，请求根本没发出去 ⟹ 浏览器取参链路未走通，本次**没有**证明库的 `SignIn` 封装路径。修好链路（`--headed` 重跑）再谈结论。\n\n")
+	}
+	if len(r.Notes) > 0 {
+		b.WriteString("备注：\n\n")
+		for _, note := range r.Notes {
+			fmt.Fprintf(&b, "- %s\n", note)
+		}
+		b.WriteString("\n")
 	}
 
 	for _, e := range r.Entries {
