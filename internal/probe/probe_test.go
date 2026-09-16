@@ -268,8 +268,55 @@ func TestRedactBody(t *testing.T) {
 	if !strings.Contains(got, `"token":"<redacted>"`) {
 		t.Fatalf("token 字段应被抹掉: %s", got)
 	}
-	if !strings.Contains(got, `"id":"c1"`) {
-		t.Fatalf("无关字段不应被改动: %s", got)
+	// id 是 CheckInRecord 主键，能追回那一条考勤记录，所以要打码。
+	if !strings.Contains(got, `"id":"<记录主键，已打码>"`) || strings.Contains(got, `"c1"`) {
+		t.Fatalf("记录主键应被打码: %s", got)
+	}
+}
+
+// 落盘的 markdown 草稿是往 docs/ 抄的原料，所以响应体里的人/课程/记录/时刻
+// 字段要按样本文档第 8 节那套规则打码；协议字段（签到码、周次、坐标）保留。
+func TestRedactBodyMasksIdentityFields(t *testing.T) {
+	body := `{"captchaVerifyResult":true,"captchaVerifyCode":"T001","checkCodeDto":{` +
+		`"id":"record-key","code":"1234","studentId":"24000000",` +
+		`"courseId":"COURSE-ID","courseSchemaId":"SCHEMA-ID","courseName":"示例课程",` +
+		`"teachName":"张三丰","teacherId":"42860","week":1,` +
+		`"expiresDate":"2026-01-02T15:04:05.000Z","recordDate":"2026-01-01T16:00:00.000Z",` +
+		`"latitude":30.313072,"longitude":120.341896}}`
+
+	got := RedactBody(body)
+
+	for _, leak := range []string{"record-key", "24000000", "COURSE-ID", "SCHEMA-ID", "示例课程", "张三丰", "42860"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("%q 泄漏: %s", leak, got)
+		}
+	}
+	for _, want := range []string{
+		`"studentId":"24*****0"`,
+		`"teachName":"张三"`,
+		`"courseName":"<课程名，已打码>"`,
+		`"id":"<记录主键，已打码>"`,
+		`"expiresDate":"2006-01-02T15:04:05.000Z"`,
+		`"recordDate":"2006-01-02T00:00:00.000Z"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("缺少 %s：%s", want, got)
+		}
+	}
+	// 协议字段不动：签到码无隐私，周次/坐标不指向人。
+	for _, keep := range []string{`"code":"1234"`, `"week":1`, `"captchaVerifyCode":"T001"`, `"latitude":30.313072`} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("不该改动 %s：%s", keep, got)
+		}
+	}
+}
+
+// 非 JSON 的响应体（网关的 text/plain、JSONP 外壳）不能被破坏。
+func TestRedactBodyLeavesPlainTextAlone(t *testing.T) {
+	for _, body := range []string{"URI too long\n", `cb1({"result":{"code":800}})`, ""} {
+		if got := RedactBody(body); got != body {
+			t.Fatalf("RedactBody(%q) = %q，非 JSON 体应原样返回", body, got)
+		}
 	}
 }
 
@@ -283,27 +330,6 @@ func TestMaskID(t *testing.T) {
 	}
 	if got := MaskID("ab"); got != "ab" {
 		t.Fatalf("短 id 不应被打码: %q", got)
-	}
-}
-
-// MaskName 一位真实姓名的字都不留：姓名对上一份班级名单就能定位人。
-// 测试数据一律用虚构姓名，真名不进仓库。
-func TestMaskName(t *testing.T) {
-	tests := []struct {
-		in, want string
-	}{
-		{"张三丰", "张三"},
-		{"欧阳修文", "张三"}, // 复姓也不再露出来
-		{"张三", "张三"},
-		{"李", "张三"}, // 单字名不再露出长度
-		{"Li Hua", "张三"},
-		{"  张三丰  ", "张三"},
-		{"", ""}, // 空串原样返回：区分「没姓名」与「已打码」
-	}
-	for _, tc := range tests {
-		if got := MaskName(tc.in); got != tc.want {
-			t.Errorf("MaskName(%q) = %q, want %q", tc.in, got, tc.want)
-		}
 	}
 }
 

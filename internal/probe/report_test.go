@@ -3,6 +3,7 @@ package probe
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // GenuineUnproven 是演练（--code 0000）里「真值档到底有没有跑起来」的唯一硬信号：
@@ -109,5 +110,52 @@ func TestMarkdownRendersAttempts(t *testing.T) {
 	// 成功那次响应是 e.Body，不该在「第 N 次响应」里重复渲染。
 	if strings.Count(md, `"captchaVerifyCode":"T001"`) != 1 {
 		t.Fatalf("成功响应被重复渲染：\n%s", md)
+	}
+}
+
+// 落盘草稿里不能出现考勤记录主键（它能追回那一条记录）；哈希形态不指向人，保留。
+func TestMarkdownMasksRecordKeys(t *testing.T) {
+	rep := &Report{
+		Version: "signinprobe/test",
+		UserID:  "24000000",
+		Entries: []Entry{
+			{Rung: RungCaptchaGenuine, ParamKind: ParamGenuine, Status: 200,
+				Before: 0, After: 1, Verdict: VerdictSuccess,
+				NewKeys: []string{"id:zvQfKIM6bzPrJeteS1T", "sha256:deadbeef"}},
+		},
+	}
+	md := rep.Markdown()
+	if strings.Contains(md, "zvQfKIM6bzPrJeteS1T") {
+		t.Fatalf("记录主键泄漏: \n%s", md)
+	}
+	// 期望值由 MaskID 推出，避免在测试里手数星号。
+	if want := "id:" + MaskID("zvQfKIM6bzPrJeteS1T"); !strings.Contains(md, want) {
+		t.Fatalf("记录主键应被打码成 %q: \n%s", want, md)
+	}
+	if !strings.Contains(md, "sha256:deadbeef") {
+		t.Fatalf("哈希形态不指向人，应保留: \n%s", md)
+	}
+	if strings.Contains(md, "24000000") {
+		t.Fatalf("学号泄漏: \n%s", md)
+	}
+	if !strings.Contains(md, "24*****0") {
+		t.Fatalf("学号应被打码: \n%s", md)
+	}
+}
+
+// 草稿里连运行时刻都不留：它和学号/课程同级，都指向「哪节课的谁」。
+func TestMarkdownMasksRunTimestamp(t *testing.T) {
+	rep := &Report{
+		Version:   "signinprobe/test",
+		StartedAt: time.Date(2026, 9, 16, 18, 31, 41, 0, time.FixedZone("CST", 8*3600)),
+	}
+	md := rep.Markdown()
+	for _, leak := range []string{"2026-09-16", "18:31", "2026-09"} {
+		if strings.Contains(md, leak) {
+			t.Fatalf("草稿泄漏运行时刻 %q:\n%s", leak, md)
+		}
+	}
+	if !strings.Contains(md, "运行时间：已打码") {
+		t.Fatalf("应标明运行时间已打码:\n%s", md)
 	}
 }

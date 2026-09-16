@@ -322,9 +322,10 @@ t+115.206s  第 111 条 GET /api/checkIn/stu-course-check-in-count?courseId=<已
 > ADR 0001 要求标注结论出自哪一次采集，文件名足够满足这一点，而日历日期本身就是可追踪信息。
 
 **打码的判据只有一条：这份内容会进 git 才需要打码**（详见
-[`signin-probe.md` §4.4](./signin-probe.md)）。`probe-results/**` 与 `*.har`
-都已 gitignore，所以报告草稿与终端日志保持原样、不在这里讨论；本文与其它
-`docs/**`、`README.md`、`*.go` 注释才会持久化，因此上表的打码是**必须**的。
+[`signin-probe.md` §4.4](./signin-probe.md)）。脚本据此把打码放在**落盘的 `md` 草稿**
+上，终端输出**不打码**（含真值，供当场核对，且不得整段外传）；`*.har` 与
+`probe-results/*.json` 是本地原始证据，不打码。本文与其它 `docs/**`、`README.md`、
+`*.go` 注释会持久化，因此上表的打码是**必须**的。
 
 ### 8.2 复现
 

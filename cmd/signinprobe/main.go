@@ -90,6 +90,13 @@ func run() error {
 	ctx := context.Background()
 	in := bufio.NewReader(os.Stdin)
 
+	// 终端输出**不**打码：当场核对「是不是本人、是不是本次窗口」需要真值。
+	// 要往仓库里带的东西只有两份落盘报告，它们的脱敏规则见
+	// docs/signin-probe.md §4.4（判据：会进 git 的内容才需要打码）。
+	fmt.Fprintln(os.Stderr, "[probe] ⚠ 本行以下的终端输出**未打码**（含真实姓名/学号）：")
+	fmt.Fprintln(os.Stderr, "[probe]    它只给你自己看，不要整段复制到 issue / 文档 / 群里。")
+	fmt.Fprintln(os.Stderr, "[probe]    落盘的 .md 草稿已按 §4.4 打码；.json 是原始证据（已 gitignore）。")
+
 	// ---------- 预置（T0 之前全部完成）----------
 	rec := probe.NewRecorder(nil)
 	clientOpts := []skl.Option{
@@ -125,7 +132,8 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("读取用户信息失败（token 可能已失效，且没有可用的账号密码重新登录）: %w", err)
 	}
-	logf("已登录：%s（%s）", probe.MaskName(user.UserName), probe.MaskID(user.ID))
+	// 终端不打码，所以这里直接打真名与真学号（见文件开头的提示）。
+	logf("已登录：%s（%s）", user.UserName, user.ID)
 
 	baseline, err := probe.ReadBackToday(client)(loginCtx)
 	if err != nil {
@@ -267,8 +275,9 @@ func run() error {
 			fmt.Fprintf(os.Stderr, "备注：%s\n", note)
 		}
 	}
-	fmt.Fprintf(os.Stderr, "\n原始报告（含未脱敏 body，已 gitignore）: %s\n", jsonPath)
-	fmt.Fprintf(os.Stderr, "脱敏草稿（人工确认后并入 docs/）: %s\n", mdPath)
+	fmt.Fprintf(os.Stderr, "\n原始报告（**未打码**，含真实 body；已 gitignore，不外传）: %s\n", jsonPath)
+	fmt.Fprintf(os.Stderr, "脱敏草稿（已按 §4.4 打码；人工确认后并入 docs/）: %s\n", mdPath)
+	fmt.Fprintln(os.Stderr, "提醒：上面这些终端输出未打码，不要整段复制出去；要带走就带走 md 草稿。")
 	if rep.WrittenWithoutCaptcha() {
 		fmt.Fprintln(os.Stderr, "结论：出现了「未用真凭证却写入记录」的档位 ⟹ 该路径不强制人机验证。")
 	}

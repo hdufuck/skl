@@ -113,6 +113,24 @@ func (r *Report) GenuineUnproven() bool {
 	return false
 }
 
+// maskRecordKeys 把读回 diff 的记录标识打码后再写进草稿。
+//
+// 标识有两种形态（见 itemKey）：`id:<CheckInRecord 主键>` 与 `sha256:<内容哈希>`。
+// 主键能追回那一条考勤记录，所以按学号同样的粒度打码；哈希不指向人，原样保留。
+//
+// 只作用于落盘的 markdown 草稿；原始 JSON 报告保留原值（已 gitignore）。
+func maskRecordKeys(keys []string) []string {
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if id, ok := strings.CutPrefix(k, "id:"); ok {
+			out = append(out, "id:"+MaskID(id))
+			continue
+		}
+		out = append(out, k)
+	}
+	return out
+}
+
 // Summary 渲染一张控制台速览表。
 func (r *Report) Summary() string {
 	var b strings.Builder
@@ -139,7 +157,10 @@ func (r *Report) Summary() string {
 // Markdown 渲染一份已脱敏、可直接粘贴进 docs/ 的报告。
 func (r *Report) Markdown() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "# 签到探针报告（%s）\n\n", r.StartedAt.Format(time.RFC3339))
+	// 运行时刻就是「哪节课」的一部分，和学号/课程同级，所以草稿里也打码；
+	// 要精确时间看文件名（probe-results/<时间戳>.md）或 .json 原始报告。
+	fmt.Fprintf(&b, "# 签到探针报告\n\n")
+	fmt.Fprintf(&b, "- 运行时间：已打码（精确时间见文件名；原始值在 .json 报告里）\n")
 	fmt.Fprintf(&b, "- 工具：`%s`\n", r.Version)
 	fmt.Fprintf(&b, "- 账号：`%s`\n", MaskID(r.UserID))
 	fmt.Fprintf(&b, "- 签到码：`%s`\n", r.Code)
@@ -215,7 +236,7 @@ func (r *Report) Markdown() string {
 			fmt.Fprintf(&b, "- 错误：`%s`\n", e.Err)
 		}
 		if len(e.NewKeys) > 0 {
-			fmt.Fprintf(&b, "- 新增记录标识：`%s`\n", strings.Join(e.NewKeys, ", "))
+			fmt.Fprintf(&b, "- 新增记录标识：`%s`\n", strings.Join(maskRecordKeys(e.NewKeys), ", "))
 		}
 		if len(e.RespHeaders) > 0 {
 			sortKeys := make([]string, 0, len(e.RespHeaders))

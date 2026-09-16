@@ -489,13 +489,12 @@ func RedactHeaders(h map[string][]string) map[string]string {
 	return out
 }
 
-// MaskID 是报告里学号的打码形式：只留前 2 位与最后 1 位，中间一律打码。
+// MaskID 是**持久化草稿**里学号的打码形式：只留前 2 位与最后 1 位。
 //
 // 例：`24000000` → `24*****0`。
 //
-// ⚠️ 这**不是安全边界**：报告与终端日志都在 gitignore 里（`probe-results/`），
-// 本来就不需要打码。它只是顺手把「从草稿往 docs/ 抄」这一步变省事
-// （docs/signin-probe.md §4.4 的判据：会进 git 的内容才需要打码）。
+// 终端输出**不**打码（方便当场核对是谁、是不是本次窗口），所以这里只服务
+// 「落盘的 markdown 草稿」这一条路径 —— 那份草稿是往 docs/ 抄的原料。
 func MaskID(id string) string {
 	r := []rune(id)
 	if len(r) <= 3 {
@@ -504,31 +503,71 @@ func MaskID(id string) string {
 	return string(r[:2]) + strings.Repeat("*", len(r)-3) + string(r[len(r)-1:])
 }
 
-// MaskName 用固定的示例假名替掉真实姓名。
+// MaskedName 是持久化草稿里替掉真实姓名的占位名。
 //
-// 只留姓氏（`张**`）也会泄露「是哪个姓的老师/同学」，所以这里**一位都不留**，
-// 整个换成张三这样的占位名。空串原样返回，方便调用方区分「没有姓名」与「姓名已打码」。
-//
-// ⚠️ 同 MaskID：这**不是安全边界**，报告与终端日志都不进 git。
-func MaskName(name string) string {
-	if strings.TrimSpace(name) == "" {
-		return ""
-	}
-	return "张三"
-}
+// 只留姓氏（`张**`）也会泄露「是哪个姓的老师/同学」，所以一位都不留。
+const MaskedName = "张三"
 
 var (
 	// 会话凭据在响应体里可能以 JSON 字段或 query 形态出现，落盘到 markdown 前一律抹掉。
 	redactJSONFieldRe  = regexp.MustCompile(`(?i)("(?:token|sessionid|x-auth-token|skl-ticket)"\s*:\s*")[^"]*(")`)
 	redactQueryValueRe = regexp.MustCompile(`(?i)\b(token|sessionId|x-auth-token|skl-ticket)=([^&\s"']+)`)
+	// 响应体里形如 "key":"value" 的字符串字段，用于按字段名挑出要打码的那些。
+	bodyStringFieldRe = regexp.MustCompile(`"(?i)([a-z]+)"\s*:\s*"((?:[^"\\]|\\.)*)"`)
 )
 
-// RedactBody 抹掉响应体里可能出现的会话凭据。
+// RedactBody 打码响应体里会随草稿持久化的敏感内容：会话凭据，以及指向
+// 「人 / 课程 / 考勤记录 / 时刻」的字段。
 //
-// 只用于渲染可提交的 markdown；原始 JSON 报告保留未脱敏 body，且已被 gitignore。
+// 打码方式与 docs/signin-success-sample.md 第 8 节一致：学号只留前 2 后 1、
+// 人名换占位名、课程与记录标识换占位符、时间值换 Go 参考时间格式。
+//
+// 只用于渲染落盘的 markdown 草稿；原始 JSON 报告保留未脱敏 body（已 gitignore），
+// 终端输出**完全不经过**这里。
 func RedactBody(body string) string {
 	out := redactJSONFieldRe.ReplaceAllString(body, "${1}<redacted>${2}")
-	return redactQueryValueRe.ReplaceAllString(out, "${1}=<redacted>")
+	out = redactQueryValueRe.ReplaceAllString(out, "${1}=<redacted>")
+	return bodyStringFieldRe.ReplaceAllStringFunc(out, func(match string) string {
+		sub := bodyStringFieldRe.FindStringSubmatch(match)
+		if len(sub) < 3 {
+			return match
+		}
+		masked, ok := maskBodyValue(strings.ToLower(sub[1]), sub[2])
+		if !ok {
+			return match
+		}
+		return `"` + sub[1] + `":"` + masked + `"`
+	})
+}
+
+// maskBodyValue 给出某个响应体字段的打码结果；第二个返回值表示是否认识这个字段。
+//
+// 不认识的字段原样保留：签到码本身无隐私（见 CONTEXT.md 与探针手册 §4.2），
+// 纬度、周次这类协议字段也不指向人。
+func maskBodyValue(key, value string) (string, bool) {
+	switch key {
+	case "studentid":
+		return MaskID(value), true
+	case "teachname", "teachername":
+		return MaskedName, true
+	case "teacherid":
+		return "<教师工号，已打码>", true
+	case "coursename":
+		return "<课程名，已打码>", true
+	case "courseid":
+		return "<课程 ID，已打码>", true
+	case "courseschemaid":
+		return "<课程 schema ID，已打码>", true
+	case "id":
+		// CheckInRecord 主键：能追回那一条考勤记录。
+		return "<记录主键，已打码>", true
+	case "expiresdate":
+		return "2006-01-02T15:04:05.000Z", true
+	case "recorddate":
+		return "2006-01-02T00:00:00.000Z", true
+	default:
+		return "", false
+	}
 }
 
 func truncateRunes(s string, n int) string {
