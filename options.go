@@ -55,7 +55,8 @@ func WithIndex(index string) Option {
 //
 // 注意这里接受的是 Transport 而不是 *http.Client：Client 需要在
 // Transport 层记录 CAS 重定向链（session token 是从 URL fragment 里捞出来的），
-// 因此不允许替换整只 http.Client。
+// 因此 Transport 始终会被 traceTransport 包裹，不允许替换整只 http.Client。
+// 手上如果是整只 *http.Client，用 WithHTTPClient（它同样只取 Transport 与 Jar）。
 func WithTransport(rt http.RoundTripper) Option {
 	return func(c *Client) {
 		if rt != nil {
@@ -109,6 +110,51 @@ func WithOnToken(fn func(token string)) Option {
 	return func(c *Client) {
 		if fn != nil {
 			c.onToken = fn
+		}
+	}
+}
+
+// WithHTTPClient 采纳调用方传入的 *http.Client 的 Transport 与 Jar。
+//
+// 用途：把已经配好代理/隧道、连接池与 cookie jar 的 client 交给 skl 复用
+// （例如受限网络里的登录链需要那只带隧道的 client）。
+//
+// 只采纳两样东西：
+//
+//   - Transport：**仍会被 skl 的 traceTransport 包裹** —— 会话 token 只出现在
+//     CAS 登录链末尾 URL 的 fragment 里，绕过 trace 层就登录不成。
+//     Transport 为 nil 时沿用默认 Transport（http.DefaultTransport 的克隆）。
+//   - Jar：SSO 登录链依赖 cookie，注入自己的 jar 才能让外部会话继续生效。
+//     Jar 为 nil 时 skl 仍会创建默认的 cookie jar。
+//
+// **不**采纳的是：
+//
+//   - Timeout：逐请求预算由 WithTimeout / Request.Timeout 决定，不是这只 client 的。
+//   - CheckRedirect：重定向上限是 skl 的策略（15 跳）。
+//
+// 与 WithTransport / WithCookieJar 同时使用时，后应用者覆盖前者。
+func WithHTTPClient(hc *http.Client) Option {
+	return func(c *Client) {
+		if hc == nil {
+			return
+		}
+		if hc.Transport != nil {
+			c.baseTransport = hc.Transport
+		}
+		if hc.Jar != nil {
+			c.jar = hc.Jar
+		}
+	}
+}
+
+// WithSSOAuthenticator 注入自定义的 SSO 鉴权实现。
+//
+// 默认实现是 github.com/U1traVeno/hduwebvpn/pkg/sso.Auth；学校改版或调用方
+// 走别的认证通道时可替换。注入 nil 时保持默认实现。
+func WithSSOAuthenticator(a SSOAuthenticator) Option {
+	return func(c *Client) {
+		if a != nil {
+			c.ssoAuth = a
 		}
 	}
 }

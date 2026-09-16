@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/hdufuck/skl"
+	"github.com/hdufuck/skl/pkg/signin"
 )
 
 func TestClassify(t *testing.T) {
@@ -193,8 +194,8 @@ func TestForgeParamWithoutSample(t *testing.T) {
 	if parsed.SceneID != skl.DefaultCaptchaSceneID {
 		t.Fatalf("sceneId = %q, want %q", parsed.SceneID, skl.DefaultCaptchaSceneID)
 	}
-	if len(parsed.CertifyID) != ForgeDefaults.CertifyIDLen {
-		t.Fatalf("certifyId 长度 = %d, want %d", len(parsed.CertifyID), ForgeDefaults.CertifyIDLen)
+	if len(parsed.CertifyID) != signin.ForgeDefaults.CertifyIDLen {
+		t.Fatalf("certifyId 长度 = %d, want %d", len(parsed.CertifyID), signin.ForgeDefaults.CertifyIDLen)
 	}
 }
 

@@ -22,6 +22,7 @@
 | 签到（`captcha-verify`） | ✅ 成功响应结构与请求形状已实测（`har#3` 浏览器抓包）；真值 `captchaVerifyParam` 由浏览器取参（`internal/chromecaptcha`）。⚠️ 「人机是否强制」仍需一次真实窗口 |
 | 签到（遗留无验证码路径） | ⚠️ 可调用，但现行前端已不再使用，且探针只能作单边证据 |
 | 一次性签到探针（`cmd/signinprobe`） | ⚠️ 已实现且单测覆盖；只在真实窗口跑过才算 ✅ |
+| 签到路径的公开 API（`pkg/signin`） | ✅ 六条路径 + 可枚举 `Method` + 公开伪造器 |
 | 钉钉免登（exempt-login）鉴权 | ❌ 未实现（需应用内 OAuth code） |
 | 钉钉 JSAPI（扫一扫、精确定位等） | ❌ 不在网络层，无法复现 |
 
@@ -91,6 +92,21 @@ for _, course := range courses {
 client, _ := skl.NewClient(skl.WithToken(token))
 ```
 
+把自己已经配好的 `*http.Client`（例如带代理/隧道的那只）与 SSO 实现交给 skl：
+
+```go
+client, _ := skl.NewClient(
+    skl.WithHTTPClient(myHTTPClient),                             // 只采纳 Transport 与 Jar
+    skl.WithSSOAuthenticator(skl.SSOAuthenticatorFunc(sso.Auth)),  // 默认就是 hduwebvpn
+    skl.WithCredentials("24000000", "password"),
+)
+```
+
+`WithHTTPClient` **不**采纳 client 自己的 `Timeout` 与 `CheckRedirect`：逐请求预算与
+重定向上限是 skl 的策略（Transport 仍会被 `traceTransport` 包裹，否则登录链末尾
+fragment 里的 token 取不到）。`WithSSOAuthenticator` 的签名与
+`hduwebvpn/pkg/sso.Auth` 完全对齐，默认实现就是它。
+
 尚未类型化的接口走逃生口：
 
 ```go
@@ -141,6 +157,53 @@ if result.CaptchaRequired() { /* 400：服务端要求滑块 */ }
 
 > ⚠️ **不要拿它们当「只校验签到码」的探针。** 这两个接口的语义是
 > 「校验并签到」。传入有效签到码可能会直接签到成功。
+
+### 三、`pkg/signin`：把其它签到路径也暴露成公开 API
+
+根包把「真值 `captchaVerifyParam` + `SignIn`」做成了主 API；探针里跑通的其余几条
+路径（尤其是「缺失 `captchaVerifyParam`」那一档，根包会直接返回
+`ErrNoCaptchaProvider` 且不发请求）以公开包
+[`pkg/signin`](pkg/signin/signin.go) 的形式提供。它**消费你自己构造的
+`*skl.Client`**，不拥有会话：
+
+```go
+import (
+    "github.com/hdufuck/skl"
+    "github.com/hdufuck/skl/pkg/signin"
+)
+
+s := signin.New(client)
+
+// 逐条调用
+out, err := s.Genuine(ctx, signin.Request{Code: "1212", Latitude: 30.123456, Longitude: 120.654321})
+
+// 或按「不需要人机 → 需要人机」的顺序成组遍历
+for _, m := range signin.Methods() {
+    out, err := s.Do(ctx, m, signin.Request{Code: "1212", Latitude: 30.123456, Longitude: 120.654321})
+    _ = out.StatusCode
+    _ = err
+}
+```
+
+| API | 端点 | 人机凭证 | 定位 |
+| --- | --- | --- | --- |
+| `Analyze` | `check-code-analyze`（JSONP，`a=0`） | 无 | 不传 |
+| `Legacy` | `code-check-in` | 无 | 传 |
+| `WithoutParam` | `captcha-verify` | **缺失** | 传 |
+| `Forged` | `captcha-verify` | `ForgeCaptchaParam(req.ForgeSample)` | 传 |
+| `WithParam` | `captcha-verify` | 强制用 `req.CaptchaVerifyParam`（空则报错） | 传 |
+| `Genuine` | `captcha-verify` | `req.CaptchaVerifyParam` 或 `CaptchaProvider` | 传 |
+
+`Outcome` **不带判读结论**：它只装状态码、原始 `*skl.Response` 与解好的
+`*skl.SignInResult` / `*skl.AnalyzeResult`。「是否强制人机」的归因留在
+`internal/probe` 与调用方。库也不做路径间自动降级、不自动重试 `200 + 空 body`
+（`skl-ticket` 是一次性的）。`signin.Methods()` 的 ID 与探针阶梯逐字对应，
+便于把结果写进日志或报告；`signin.Find(id)` 按 ID 取回单条方式。
+
+> ⚠️ `WithoutParam` / `WithParam` / `Forged` / `ForgeCaptchaParam` 发出的都是
+> **真实签到请求**：一旦服务端不强制人机验证，它们可能写入真实 `CheckInRecord`。
+> 这些能力照常公开，后果由使用者承担。本机发出的**失败**只作弱证据（ADR 0002），
+> 不得单独用来判定「服务端强制人机验证」。
 
 ## 人机验证（最大风险点）
 
