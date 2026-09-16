@@ -147,10 +147,10 @@ func TestMarkdownMasksRecordKeys(t *testing.T) {
 func TestMarkdownMasksRunTimestamp(t *testing.T) {
 	rep := &Report{
 		Version:   "signinprobe/test",
-		StartedAt: time.Date(2026, 9, 16, 18, 31, 41, 0, time.FixedZone("CST", 8*3600)),
+		StartedAt: time.Date(2019, 3, 4, 5, 6, 7, 0, time.FixedZone("CST", 8*3600)),
 	}
 	md := rep.Markdown()
-	for _, leak := range []string{"2026-09-16", "18:31", "2026-09"} {
+	for _, leak := range []string{"2019-03-04", "05:06", "2019-03"} {
 		if strings.Contains(md, leak) {
 			t.Fatalf("草稿泄漏运行时刻 %q:\n%s", leak, md)
 		}

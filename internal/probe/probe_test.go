@@ -281,7 +281,7 @@ func TestRedactBodyMasksIdentityFields(t *testing.T) {
 		`"id":"record-key","code":"1234","studentId":"24000000",` +
 		`"courseId":"COURSE-ID","courseSchemaId":"SCHEMA-ID","courseName":"示例课程",` +
 		`"teachName":"张三丰","teacherId":"42860","week":1,` +
-		`"expiresDate":"2026-01-02T15:04:05.000Z","recordDate":"2026-01-01T16:00:00.000Z",` +
+		`"expiresDate":"2019-03-04T05:06:07.000Z","recordDate":"2019-03-03T16:00:00.000Z",` +
 		`"latitude":30.313072,"longitude":120.341896}}`
 
 	got := RedactBody(body)
