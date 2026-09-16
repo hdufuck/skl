@@ -2,6 +2,7 @@ package skl
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
 	"net/http"
@@ -290,6 +291,37 @@ func TestSignInSendsExactCaptchaVerifyParamSet(t *testing.T) {
 	}
 }
 
+// `har#3` 的浏览器抓包（har 第 101 条）显示：官方签到请求的 body 为空，
+// 但**仍然**带 `Content-Type: application/x-www-form-urlencoded`。
+// 库此前只在 body 非空时设这个头，导致真值档的请求与官方请求不是逐字节一致。
+func TestSignInSendsFormContentTypeWithEmptyBody(t *testing.T) {
+	t.Parallel()
+
+	m := newMockSkl(t)
+	c := newMockClient(t, m,
+		WithToken(m.Token),
+		WithCaptchaProvider(StaticCaptchaProvider{Value: `{"sceneId":"2q42bw25"}`}),
+	)
+
+	_, err := c.SignIn(t.Context(), SignInRequest{Code: "1234", Latitude: 30.00001, Longitude: 120.00001})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+
+	m.mu.Lock()
+	ct, bodyLen := m.lastCaptchaVerifyContentType, m.lastCaptchaVerifyBodyLen
+	m.mu.Unlock()
+
+	// body 为空（参数全在 query 里），但 Content-Type 仍必须是 form。
+	if bodyLen != 0 {
+		t.Fatalf("body 长度 = %d, want 0（参数全在 query 里）", bodyLen)
+	}
+	if ct != ContentTypeFormURLEncoded {
+		t.Fatalf("Content-Type = %q, want %q", ct, ContentTypeFormURLEncoded)
+	}
+}
+
 func TestFormatCoordinate(t *testing.T) {
 	t.Parallel()
 
@@ -326,7 +358,7 @@ func TestUnwrapJSONP(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := unwrapJSONP([]byte(tt.body), "cb1")
+			got, err := unwrapJSONP([]byte(tt.body))
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("unwrapJSONP(%q) = %q, want error", tt.body, got)
@@ -377,4 +409,55 @@ func itoa(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// OK() 是「状态码区分不了三种结局」这一事实的落点：200 也可能是人机被拒。
+// 判据取自 `har#3` 抓包（成功 T001 + checkCodeDto；失败 F001 无 checkCodeDto）。
+func TestSignInResultOK(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{
+			name: "成功：captchaVerifyResult=true 且有 checkCodeDto",
+			in:   `{"captchaVerifyResult":true,"captchaVerifyCode":"T001","checkCodeDto":{"id":"x"}}`,
+			want: true,
+		},
+		{
+			name: "人机被拒：200 + F001，无 checkCodeDto",
+			in:   `{"captchaVerifyResult":false,"captchaVerifyCode":"F001"}`,
+			want: false,
+		},
+		{
+			name: "true 但 checkCodeDto 为 null",
+			in:   `{"captchaVerifyResult":true,"checkCodeDto":null}`,
+			want: false,
+		},
+		{
+			name: "缺 captchaVerifyResult（例如 401 业务错误体）",
+			in:   `{"code":0,"msg":"签到码不存在，不要玩我"}`,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var got SignInResult
+			if err := json.Unmarshal([]byte(tt.in), &got); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if got.OK() != tt.want {
+				t.Fatalf("OK() = %v, want %v", got.OK(), tt.want)
+			}
+		})
+	}
+
+	var nilResult *SignInResult
+	if nilResult.OK() {
+		t.Fatal("nil.OK() = true, want false")
+	}
 }

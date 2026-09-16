@@ -43,20 +43,25 @@ https://skl.hdu.edu.cn/api
 
 | 形态 | 含义 |
 | --- | --- |
-| `200` + JSON | 正常 |
+| `200` + JSON | 正常；但也可能是**业务失败**（见下面两行） |
+| `200` + `{"captchaVerifyResult":false,"captchaVerifyCode":"F001"}` | **人机判定失败**（不是 401）。签到的失败判定见 §3.2 |
 | `200` + **空 body** | `skl-ticket` 重放，或（未证实）被限流。**不能用状态码判断成败** |
 | `400` + `{"code":0,"msg":"..."}` | 参数缺失/非法（如 `Request method 'POST' is not supported`） |
 | `401` + `{"code":0,"msg":"..."}` | **业务校验失败**（如「签到码不存在，不要玩我」） |
 | `401` + `{"url":"..."}` | **会话失效**，需跳转该 URL 走 CAS 登录 |
 | `403` | 无权限（前端文案「没有权限」） |
+| `414` + `text/plain` `URI too long` | **网关**在请求行阶段就拒了（`X-Kong-Response-Latency`、无 CORS、`Connection: close`），应用层没收到。见 §3.2。`413` 同类，⚠️ 未实测 |
 
 `401` 不是「空 body」：业务失败会带 JSON。两个键（`url` / `msg`）就是区分
 会话失效与业务失败的唯一判据。
 
 ### 1.3 参数约定
 
-- 日期：`2006-01-02`（如 `startTime=2026-09-14`、`startDate`/`endDate`）
-- 时间戳：毫秒（`recordDate`、`expiresIn`、`t`）
+- 日期：`2006-01-02`（如 `startTime=2006-01-02`、`startDate`/`endDate`）
+- 时间戳：毫秒（`t`）
+- **ISO-8601 UTC 串**：`recordDate`、`expiresDate`。`recordDate` 是**当天 00:00（北京时间）**
+  以 UTC 串表示（形如 `2006-01-01T16:00:00.000Z`，即北京 2006-01-02 00:00），语义是「哪一天」而非时刻
+- **时长（毫秒）**：`expiresIn`（实测 `20000` = 20 秒，不是时间戳）。见 §3.2
 - 经纬度：十进制浮点；前端用钉钉 `coordinate: 0`（⚠️ 它到底对应哪种坐标系未证实，见 §5）
 - 大批接口用 `params`（query）而非 body，即使语义上是写操作
 - 数组与复杂对象常见于 POST body
@@ -113,18 +118,65 @@ GET  /cas/login?ticket= → 302 → https://skl.hdu.edu.cn/index.html#?token=<uu
 | GET | `/checkIn/valid-code` | `code`、`id` | ✅ | 图形验证码流程；无会话时 `400 + 空 body` |
 | GET | `/checkIn/create-code-img` | — | ✅ | 返回图片 blob（图形验证码） |
 
-**`captcha-verify` 的响应**（📖 字段名与消费方式取自前端 bundle，⚠️ 抓包里的两次签到都
-401，所以成功响应未实测）：
+**`captcha-verify` 的成功响应**（✅ `har#3` 浏览器抓包，全文见
+[`signin-success-sample.md`](./signin-success-sample.md)）：
 
 ```json
-{ "captchaVerifyResult": ..., "checkCodeDto": ... }
+{"captchaVerifyResult":true,"captchaVerifyCode":"T001","checkCodeDto":{
+  "id":"<记录主键>","code":"<4 位签到码>","studentId":"24*****4",
+  "courseId":"<32 位大写 hex>","courseSchemaId":"<21 字符>",
+  "courseName":"<课程名>","teachName":"张三","teacherId":"<工号>","week":1,
+  "recordDate":"2006-01-01T16:00:00.000Z","expiresIn":20000,
+  "expiresDate":"2006-01-02T15:04:05.000Z",
+  "latitude":30.313072,"longitude":120.341896,
+  "requestLatitude":30.31878,"requestLongitude":120.339417,
+  "totalCheckInRecord":null}}
 ```
 
-📖 前端的消费方式（`index-new-*.js` 的人机回调）：把 `captchaVerifyResult` 直接交给阿里云
-SDK 当 `captchaResult`，并要求**严格 `=== true`** 才跳 `/sign/in/detail`；
-`false`/`undefined` 会让 SDK 重开滑块，其它真值则静默无操作。`checkCodeDto` 被整体存入
-store，只在其它页面读到 `courseId`、`courseName`、`id`、`courseSchemaId`、`teachName`、
-`recordDate`（**没有任何地方读 `distance`**）。
+上例中的**时间值一律用 Go 参考时间格式**（`2006-01-02T15:04:05.000Z`）占位，
+人名用 `张三`，学号只留前 2 位与后 1 位，课程标识全部打码 —— 样本里的真实
+日期、钟点、课程与人名可合起来定位到具体的人与那节课，所以不入库（规则见样本文档第 8 节）。
+围栏中心坐标真实响应是 16 位有效数字，此处只留 6 位。
+
+| 字段 | 类型 | 说明 | 等级 |
+| --- | --- | --- | --- |
+| `captchaVerifyResult` | bool | 服务端对本次 `CaptchaVerifyParam` 的判定 | ✅ |
+| `captchaVerifyCode` | string | 成功 `T001` / 人机失败 `F001`。此前未知；前端不消费它 | ✅ |
+| `checkCodeDto` | object | 成功时是 `CheckInRecord` 详情；**失败时整个键不存在**（17 个字段见样本文档） | ✅ |
+
+`captchaVerifyCode`/`F001`/`T001` 这三个字面量对 `har#3` 抓包里的**全部前端产物**
+（含 5 个 `cx.*` 交互模块、`AliyunCaptcha.js`、FeiLin 设备指纹 JS）做字面检索，
+**0 命中** —— 由服务端产生，前端只透传 `captchaVerifyResult`。
+
+**同一接口的四种形态**（✅ 全部实测）：
+
+| 形态 | 含义 |
+| --- | --- |
+| `200` + `captchaVerifyResult:true` + 非空 `checkCodeDto` | 签到成功 |
+| `200` + `captchaVerifyResult:false` + `captchaVerifyCode:\`F001\`` | **人机层单独拒签**。同一有效签到码换一个 `captchaVerifyParam` 就会走这里 |
+| `401` + `{"code":0,"msg":"签到码不存在，不要玩我"}` | 签到码校验**先于**人机校验，所以这条对「是否强制」无信息 |
+| `414` + `text/plain` `URI too long` | **网关**拒了超长请求行，应用层没收到。`CaptchaVerifyParam` 里的 `data` 会膨胀到 25 KB 量级 |
+
+> ⚠️ **`captchaVerifyParam` 有长度风险。** `har#3` 采集里两个「静默人机
+> （`TRACELESS`）」样本的 `data` 长 25–27 KB，整条 URL 27.8–29.1 KB，被网关以
+> `414` 拒掉；而同一次采集里成功的样本只有 4.4 KB。实测包线：
+> 请求行 **5615 ≤ 上限 < 27839** 字节（完整 URL 再加 8）。上游是 Kong 前置的
+> nginx，`413` 同类但未实测。库侧**不做**长度预检：`SignIn` 拿到多长的参数就发多长，
+> 要不要先看长度由调用方自己决定（超过约 5.6 KB 就该预期 414）。
+
+`checkCodeDto` 里**没有** `distance` 字段（围栏距离只在教师端 `history-list`）。
+前端把 `checkCodeDto` 整体存入 store，只读 `courseId`、`courseName`、`id`、
+`courseSchemaId`、`teachName`、`recordDate`。
+
+📖 前端的消费方式（`assets/index-new-dX4pM4CL.js` 的人机回调，`har#3` 抓包的版本）：
+把 `captchaVerifyResult` 直接交给阿里云 SDK 当 `captchaResult`，并要求**严格 `=== true`**
+才经 `onBizResultCallback(true)` 跳 `/sign/in/detail`；返回 `false` 会让 SDK 重开验证码
+（抓包第 98→101 条就是这样从 `F001` 重来一次后成功的）。
+
+> ⚠️ 人机验证是否**强制**无法用无效签到码证伪：签到码校验先于验证码，
+> 缺失/伪造/不传 `captchaVerifyParam` 都返回同一个
+> `401 {"code":0,"msg":"签到码不存在，不要玩我"}`。
+> 判定方法见 **[签到探针手册](./signin-probe.md)**。
 
 `check-code-analyze` 的业务码（前端分支判断）：`100`/`200` 成功，
 `400` 要求滑块，`800`/`900` 被拒。实测无效签到码得到 `800`。
@@ -334,15 +386,16 @@ store，只在其它页面读到 `courseId`、`courseName`、`id`、`courseSchem
 
 | 项 | 状态 |
 | --- | --- |
-| `captcha-verify` 成功响应结构 | 📖 契约已知（`captchaVerifyResult` 必须是严格 `true`，`checkCodeDto` 整体存入 store），⚠️ 无实测样本 |
-| `captcha-verify` 是否**强制**人机验证 | ⚠️ 无法用无效签到码证伪（见 3.2），待窗口 |
+| `captcha-verify` 成功响应结构 | ✅ 已实测（`har#3` 浏览器抓包；全文见 [`signin-success-sample.md`](./signin-success-sample.md)） |
+| `captcha-verify` 是否**强制**人机验证 | ⚠️ 仍未知。已知「有效签到码 + 人机不通过」= `200 F001`，但**没有**「有效签到码 + 缺失参数」的样本（见 3.2） |
 | `checkIn/code-check-in` 完整参数集 | ⚠️ 仅知 `code`/`id` 可到达业务逻辑；📖 且现行前端**零调用者** |
 | `check-code-analyze` 的 `code` 语义 | 📖 前端传的是定位就绪标志（布尔），与签到码无关；所在路由不可达 |
 | `/checkIn/stu-check-count` 的 `list` 元素 | 实测为 `[]`（**基线为空**，不是接口失明） |
 | `/check-in-student-detail/*` 响应元素 | 实测为 `[]`（同上） |
 | 各接口的角色权限边界 | 未逐个验证；403 文案为「没有权限」 |
-| `CheckInCount` 中课程信息字段 | 前端整体展开，按命名惯例补齐，未逐字段实测 |
-| `checkCodeDto` 内部结构 | ⚠️ 完全未知（只知被读的六个字段名） |
+| `CheckInCount` 中课程信息字段 | ⚠️ 结构存疑：实测元素是**身份字段**（`id`/`userId`/`classNo`/`name`/`major`/`unitCode`/`unitName`/`grade`/`studyLevel`），库里补的是 `courseCode` 系字段 |
+| `checkCodeDto` 内部结构 | ✅ 17 个字段已实测（见 3.2 与样本文档） |
+| `captchaVerifyParam` 一次性 / 有效期 | ⚠️ 本次不证明：抓包里 5 个 `certifyId` 各用一次，无重放 |
 | 服务端是否校验 `t` | 本次不证明：需专门探针，且不影响库的形态 |
 | `coordinate: 0` 的坐标系语义 | 本次不证明：需教师端 `distance` 列 |
 | `distance` 超限是否拒签 | 本次不证明：需伪造远端坐标写一条异常记录；该主张已由项目所有者确认，无证据债 |

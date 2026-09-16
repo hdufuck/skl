@@ -2,7 +2,7 @@
 
 杭电学勤系统（`skl.hdu.edu.cn`）的非官方 Go 客户端。
 
-从两份钉钉手机端 Reqable 抓包（2026-09-14）、skl 前端构建产物、以及**真机验证**三方
+从两份钉钉手机端 Reqable 抓包（`har#1`、`har#2`，见 `doc.go` 的证据来源）、skl 前端构建产物、以及**真机验证**三方
 交叉确认后，把会话获取、nonce 管理、以及 skl 特有的失败模式封装成可复用的 Go 包。
 
 > **证据来源提醒**：两份 HAR 里**不包含** skl 的 CAS 登录链
@@ -19,7 +19,7 @@
 | token 注入 / 持久化 / 401 自动重登 | ✅ 已验证 |
 | 只读接口（用户、课表、考勤统计、考核项） | ✅ 已验证 |
 | skl-ticket 一次性 nonce 语义 | ✅ 已验证 |
-| 签到（`captcha-verify`） | ⚠️ 协议已封装；真值 `captchaVerifyParam` 由浏览器取参（`internal/chromecaptcha`），待窗口实测 |
+| 签到（`captcha-verify`） | ✅ 成功响应结构与请求形状已实测（`har#3` 浏览器抓包）；真值 `captchaVerifyParam` 由浏览器取参（`internal/chromecaptcha`）。⚠️ 「人机是否强制」仍需一次真实窗口 |
 | 签到（遗留无验证码路径） | ⚠️ 可调用，但现行前端已不再使用，且探针只能作单边证据 |
 | 一次性签到探针（`cmd/signinprobe`） | ⚠️ 已实现且单测覆盖；只在真实窗口跑过才算 ✅ |
 | 钉钉免登（exempt-login）鉴权 | ❌ 未实现（需应用内 OAuth code） |
@@ -165,7 +165,22 @@ if result.CaptchaRequired() { /* 400：服务端要求滑块 */ }
 1. chromecaptcha：在真实源下交付极简页 → 加载 AliyunCaptcha.js → 点一次触发按钮
 2. 拿到真值 captchaVerifyParam（一次性，90s 内要用掉）
 3. client.SignIn{Code, Latitude, Longitude, CaptchaVerifyParam: 真值}
+4. 判成败必须用 result.OK()：HTTP 200 也可能是人机被拒（见下）
 ```
+
+签到有**四种**结局，**状态码区分不了**（均已实测）：
+
+| 形态 | 含义 |
+| --- | --- |
+| `200` + `captchaVerifyResult:true` + 非空 `checkCodeDto` | 成功（`captchaVerifyCode:"T001"`） |
+| `200` + `captchaVerifyResult:false` | **人机层单独拒签**（`captchaVerifyCode:"F001"`） |
+| `401` + `{"code":0,"msg":"签到码不存在，不要玩我"}` | 签到码校验**先于**人机校验 |
+| `414` + `text/plain` `URI too long` | **网关**拒了超长请求行（`captchaVerifyParam.data` 会膨胀到 25 KB 量级） |
+
+所以库提供了 [`SignInResult.OK`](signin.go)；完整响应结构、18 个 `checkCodeDto`
+字段与四种响应形态见 [`docs/signin-success-sample.md`](docs/signin-success-sample.md)。
+
+> ⚠️ 实测窗口可以只有 **20 秒**（`expiresIn=20000`），不要假设宽裕。
 
 完整流程、相位预算与手机端配合见 [`docs/signin-probe.md`](docs/signin-probe.md)。
 
@@ -178,6 +193,11 @@ if result.CaptchaRequired() { /* 400：服务端要求滑块 */ }
 因此「无效签到码」永远无法区分验证码是否真的被校验。要证实，
 必须在一个真实有效的签到码上试一次——那会直接产生考勤记录，
 所以本包没有替你决定。
+
+`har#3` 那次浏览器签到补上了一半答案：**有效签到码 + 人机不通过**得到的是
+`200 {"captchaVerifyResult":false,"captchaVerifyCode":"F001"}`（**不是** 401）——
+说明人机层确实会单独拦一次请求。但「有效码 + 完全不给参数」仍未被采样，
+所以「是否**强制**」依然只能靠探针在真实窗口里回答。
 
 同理，遗留接口 `checkIn/code-check-in` 与 `ali-nvc/check-code-analyze`
 也**不能在拿到有效签到码前证伪**。但要注意：bundle 级检索显示它们**不是**「官方页面也会走的备用路」——
@@ -193,10 +213,11 @@ if result.CaptchaRequired() { /* 400：服务端要求滑块 */ }
 | 2 | `code-check-in`（无人机凭证、带定位） |
 | 3 | 有效码 + **缺失** `captchaVerifyParam`（直接回答「是否强制」） |
 | 4 | 有效码 + **结构合法但伪造**的凭证（把参数层与人机层分开） |
-| 5 | 有效码 + **官方 SDK 真值** → 库的 `SignIn`（验证库的封装路径） |
+| 5 | 有效码 + **官方 SDK 真值** → 库的 `SignIn`（验证库的封装路径；失败自动换新参数最多 3 次） |
 
-预置清单、30 秒相位预算、写入闸门、读回判读表、脱敏规则、以及手机端
-（钉钉 + Reqable 上报服务器）要做的每一步，都在那份手册里。
+预置清单、相位预算（默认 8s + 23s，可用 `--ladder-deadline` /
+`--captcha-deadline` 收紧到 20s 窗口以内）、写入闸门、读回判读表、脱敏规则、
+以及手机端（钉钉 + Reqable 上报服务器）要做的每一步，都在那份手册里。
 这套实验的约束与取舍——为什么允许从本机发探针、为什么本机失败只作弱证据、
 为什么继续排除模拟器——见
 [`docs/adr/0002-本机探针与浏览器取参的取舍.md`](docs/adr/0002-本机探针与浏览器取参的取舍.md)。

@@ -37,6 +37,10 @@ type mockSkl struct {
 	lastCodeCheckInQuery url.Values
 	// lastCaptchaVerifyQuery 记录 ★ 接口 POST /api/ali-nvc/captcha-verify 的 query。
 	lastCaptchaVerifyQuery url.Values
+	// lastCaptchaVerifyContentType / lastCaptchaVerifyBodyLen 记录同一次请求的
+	// Content-Type 与 body 长度：官方请求即使 body 为空也带 form 头。
+	lastCaptchaVerifyContentType string
+	lastCaptchaVerifyBodyLen     int64
 
 	server *httptest.Server
 
@@ -143,6 +147,8 @@ func newMockSkl(t *testing.T) *mockSkl {
 	mux.HandleFunc("/api/ali-nvc/captcha-verify", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
 		m.lastCaptchaVerifyQuery = r.URL.Query()
+		m.lastCaptchaVerifyContentType = r.Header.Get("Content-Type")
+		m.lastCaptchaVerifyBodyLen = r.ContentLength
 		m.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -474,7 +480,7 @@ func TestResolveURLEscapesAndMergesQuery(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	got, err := c.resolveURL("/api/course?startTime=2026-09-14", url.Values{
+	got, err := c.resolveURL("/api/course?startTime=2006-01-02", url.Values{
 		"extra": {"a b"},
 	})
 	if err != nil {
@@ -485,7 +491,7 @@ func TestResolveURLEscapesAndMergesQuery(t *testing.T) {
 		t.Fatalf("resolveURL = %q", got.String())
 	}
 	q := got.Query()
-	if q.Get("startTime") != "2026-09-14" {
+	if q.Get("startTime") != "2006-01-02" {
 		t.Fatalf("startTime = %q", q.Get("startTime"))
 	}
 	if q.Get("extra") != "a b" {

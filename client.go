@@ -40,6 +40,12 @@ const (
 	// HeaderTicket 是一次性防重放 nonce 请求头。
 	HeaderTicket = "skl-ticket"
 
+	// ContentTypeFormURLEncoded 是 skl 沿用 form 编码的那批请求的 Content-Type。
+	//
+	// 注意：官方签到接口（`POST /api/ali-nvc/captcha-verify`）把参数全放在
+	// query 里、body 为空，但**仍然**带这个头（`har#3` 抓包第 101 条）。
+	ContentTypeFormURLEncoded = "application/x-www-form-urlencoded"
+
 	userAgent = "hdufuck/skl (+https://github.com/hdufuck/skl)"
 
 	// maxResponseBytes 限制单次响应体大小，避免异常响应打爆内存。
@@ -49,12 +55,18 @@ const (
 // Request 描述一次 skl API 调用。
 type Request struct {
 	Method string
-	// Path 是 API 路径，例如 "/userinfo" 或 "/course?startTime=2026-09-14"。
+	// Path 是 API 路径，例如 "/userinfo" 或 "/course?startTime=`har#1`/`har#2`"。
 	Path string
 	// Query 会合并进 Path 自带的 query。
-	Query  url.Values
-	Body   []byte
+	Query url.Values
+	Body  []byte
+	// Header 是附加请求头。
 	Header http.Header
+	// ContentType 显式指定 Content-Type，**空 body 时也生效**。
+	//
+	// 留空时沿用默认行为（仅当 body 非空才补 form 头）；签到这类
+	// 「参数在 query、body 为空」的接口必须显式给出，才能与官方请求逐字节一致。
+	ContentType string
 
 	// Timeout 覆盖 Client 的默认超时。
 	Timeout time.Duration
@@ -319,8 +331,11 @@ func (c *Client) execute(ctx context.Context, method string, req *Request) (*Res
 	if hreq.Header.Get("Referer") == "" {
 		hreq.Header.Set("Referer", c.baseURL+"/"+c.index)
 	}
-	if len(req.Body) > 0 && hreq.Header.Get("Content-Type") == "" {
-		hreq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if req.ContentType != "" {
+		// 显式指定：空 body 时也生效（官方签到请求就是这个形态）。
+		hreq.Header.Set("Content-Type", req.ContentType)
+	} else if len(req.Body) > 0 && hreq.Header.Get("Content-Type") == "" {
+		hreq.Header.Set("Content-Type", ContentTypeFormURLEncoded)
 	}
 	// 每个请求一个全新的 nonce：服务端按一次性值校验，重放会返回
 	// 200 + 空 body。

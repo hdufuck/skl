@@ -1,6 +1,6 @@
 // Package skl 是杭电学勤系统（skl.hdu.edu.cn）的非官方 Go 客户端。
 //
-// 数据来源：两份钉钉手机端 Reqable 抓包（2026-09-14）加真机验证。
+// 数据来源：两份钉钉手机端 Reqable 抓包（`har#1`、`har#2`）加真机验证。
 // 鉴权流程、请求头、nonce 语义均已实测确认；签到的人机验证部分是本次
 // 逆向的边界，详见「风险与未解项」。
 //
@@ -35,10 +35,20 @@
 // 本包的事实来自三个相互独立、可信度不同的来源，文档中凡涉及“实测”
 // 的地方都指第 3 类：
 //
-//  1. 两份 Reqable 抓包（2026-09-14）。提供了：X-Auth-Token / skl-ticket
-//     两个头、/api/userinfo / /api/course / /api/dingtalk/jsapi_ticket
-//     等只读接口的响应、两次失败的签到（401「签到码不存在」）、
-//     以及阿里云验证码的相关域名与 SDK 版本 3.29.0。
+// **采集编号。** 下面用 `har#1` / `har#2` / `har#3` 指代三次采集，而不写具体日历日期
+// —— 日期与钟点本身也是可追踪信息（日期 + 课程 + 人 合起来就能定位到「谁在哪节课签的」）。
+// `har#1`、`har#2` 是两份钉钉手机端 Reqable 抓包；`har#3` 是 `skl.hdu.edu.cn2.har`
+// （Chrome 网页签到，唯一一份成功样本，详见 docs/signin-success-sample.md）。
+//
+//  1. 三份抓包。`har#1`、`har#2`（两份 Reqable 手机抓包）提供了：X-Auth-Token /
+//     skl-ticket 两个头、/api/userinfo / /api/course
+//     / /api/dingtalk/jsapi_ticket 等只读接口的响应、两次失败的签到
+//     （401「签到码不存在」）、以及阿里云验证码的相关域名与 SDK 版本 3.29.0。
+//     `har#3`（`skl.hdu.edu.cn2.har`，Chrome 网页签到）补上了唯一一份**成功**
+//     签到响应（`200 {captchaVerifyResult:true, captchaVerifyCode:"T001",
+//     checkCodeDto:{…}}`）、`200 + F001` 的人机拒签、网关的 `414 URI too long`、
+//     以及 `expiresIn=20000`（窗口可以只有 20 秒）。详见
+//     docs/signin-success-sample.md。
 //  2. skl 前端构建产物（index-*.js / vendor-*.js / useAuthSession-*.js）。
 //     提供了：token 存在 localStorage.sessionId、skl-ticket = nanoid(21)、
 //     登录跳转契约、签到页调用 captcha-verify 的参数、遗留接口清单、

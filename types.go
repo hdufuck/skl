@@ -17,7 +17,7 @@ const (
 
 // UserInfo 是 `GET /api/userinfo` 的响应，同时也是会话有效性的探针。
 //
-// 字段形态取自 2026-09-14 的实测抓包，全部字段保留原始 JSON 名。
+// 字段形态取自 `har#1`/`har#2` 的实测抓包，全部字段保留原始 JSON 名。
 type UserInfo struct {
 	AcademicCredentials json.RawMessage `json:"academicCredentials"`
 	Birthday            *time.Time      `json:"birthday"`
@@ -116,9 +116,15 @@ type SchoolUnit struct {
 // CheckInCount 是 `GET /api/checkIn/stu-course-check-in-count` 返回数组中的元素，
 // 表示某门课一学期的考勤统计。
 //
-// 前七个字段由 skl 前端考勤明细页直接消费，可视为已实测；
-// 其余课程信息字段前端是整体展开的（`{...s}`），这里按命名惯例补齐，
-// 尚未逐字段实测。
+// 前七个字段由 skl 前端考勤明细页直接消费，可视为已实测。
+//
+// ⚠️ 其余字段是**按命名惯例补齐的猜测**，`har#3` 的抓包并不支持它们：
+// 抓到的元素（`/checkIn/stu-course-check-in-count`）实际带的是**身份字段**
+// （`id`、`userId`、`classNo`、`name`、`major`、`unitCode`、`unitName`、
+// `grade`、`studyLevel`），而不是这里的 `courseCode` 系；未实测到
+// `courseId`/`courseName`/`teacherName`。另外实测值 `absentTimeCount` 是 `0.0`
+// （浮点），而这里的类型是 `int`（整数值能被 json 接受，非整数值会让整个数组解码失败）。
+// 要动这几个字段之前先补一次实测。
 type CheckInCount struct {
 	AbsentCount      int     `json:"absentCount"`
 	AbsentLeaveCount int     `json:"absentLeaveCount"`

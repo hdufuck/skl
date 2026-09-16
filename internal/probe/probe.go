@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 
@@ -112,6 +113,14 @@ const (
 	VerdictCodeRejected Verdict = "code_rejected"
 	// VerdictEmptyBody：200 但响应体为空（skl-ticket 重放或被 WAF 拦截）。
 	VerdictEmptyBody Verdict = "empty_body"
+	// VerdictURITooLong：请求行超长，被网关拒绝（`414` 是 `har#3` 实测；`413` 同类、未实测，一并归到这一类）。
+	//
+	// `har#3` 抓包第 6/10 条：`TRACELESS` 的 `data` 会膨胀到 25 KB 量级，
+	// 整条 URL 超过网关的请求行上限（实测包线：请求行 5615 ≤ L < 27839 字节，即完整 URL 5623 ≤ L < 27847），
+	// 服务端返回 `414 URI too long`（`text/plain`、无 CORS、
+	// 带 `X-Kong-Response-Latency`）——**应用层根本没收到这个请求**，
+	// 因此它既不指向人机层也不指向参数层，必须单独成一类。
+	VerdictURITooLong Verdict = "uri_too_long"
 	// VerdictUnattributable：无法归因。
 	VerdictUnattributable Verdict = "unattributable"
 	// VerdictTransportError：请求根本没发出去或读不到响应。
@@ -133,6 +142,8 @@ func (v Verdict) Evidence() string {
 		return "无（签到码先于风控校验）"
 	case VerdictEmptyBody:
 		return "无（工具/网络层）"
+	case VerdictURITooLong:
+		return "强（网关拒绝请求行，未达应用）"
 	case VerdictTransportError:
 		return "无（工具/网络层）"
 	default:
@@ -160,14 +171,17 @@ type ClassifyInput struct {
 
 	// CaptchaVerifyResult 是响应里 captchaVerifyResult 的布尔值；缺失时为 nil。
 	CaptchaVerifyResult *bool
+	// CaptchaVerifyCode 是响应里 captchaVerifyCode 的值（成功 `T001` /
+	// 失败 `F001`）。该字段由 `har#3` 抓包首次观察到；为空串表示缺失。
+	CaptchaVerifyCode string
 	// CheckCodeDtoLen 是响应里 checkCodeDto 序列化后的字节长度。
 	CheckCodeDtoLen int
 }
 
 // Classify 把一档探针的观测映射成判读结论。
 //
-// 规则顺序即优先级：先看「有没有写入记录」（最强的行为证据），再看业务码，
-// 再看文案。
+// 规则顺序即优先级：先看「有没有写入记录」（最强的行为证据），再看网关层，
+// 再看业务码，最后看文案。
 func Classify(in ClassifyInput) Verdict {
 	if in.Err != "" && in.Status == 0 {
 		return VerdictTransportError
@@ -184,6 +198,11 @@ func Classify(in ClassifyInput) Verdict {
 		return VerdictEmptyBody
 	}
 
+	// 网关在请求行阶段就拒了，应用层没有任何参与。
+	if in.Status == http.StatusRequestEntityTooLarge || in.Status == http.StatusRequestURITooLong {
+		return VerdictURITooLong
+	}
+
 	if in.HasAnalyzeCode {
 		switch in.AnalyzeCode {
 		case 100, 200:
@@ -195,8 +214,15 @@ func Classify(in ClassifyInput) Verdict {
 		}
 	}
 
-	if in.CaptchaVerifyResult != nil {
-		if !*in.CaptchaVerifyResult {
+	// captchaVerifyResult 是主判据；缺失时用 captchaVerifyCode 补充。
+	captchaResult := in.CaptchaVerifyResult
+	if captchaResult == nil {
+		if passed, ok := captchaCodeVerdict(in.CaptchaVerifyCode); ok {
+			captchaResult = &passed
+		}
+	}
+	if captchaResult != nil {
+		if !*captchaResult {
 			return VerdictCaptchaRejected
 		}
 		if in.CheckCodeDtoLen > 0 {
@@ -227,6 +253,44 @@ func Classify(in ClassifyInput) Verdict {
 
 func isCaptchaRung(r RungID) bool {
 	return r == RungCaptchaMissing || r == RungCaptchaForged || r == RungCaptchaGenuine
+}
+
+// captchaCodeVerdict 把 captchaVerifyCode 翻译成人机判定。
+//
+// 只认 `har#3` 抓包里实测到的两个值（成功 `T001` / 失败 `F001`）；
+// 其它值一律「没有意见」，交由 captchaVerifyResult 或文案判断。
+func captchaCodeVerdict(code string) (bool, bool) {
+	switch strings.ToUpper(strings.TrimSpace(code)) {
+	case "T001":
+		return true, true
+	case "F001":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// LongestAcceptedURLLen 是 `har#3` 采集中**被服务端接受**的最长请求 URL
+// （字节，含 `https://skl.hdu.edu.cn` 的 22 字节）。
+//
+// 同一采集里 27847 字节的同类 URL 被网关以 `414 URI too long` 拒掉。
+// 换算成**请求行**（减掉 scheme+host 的 22 字节，加上 `POST ` 与 ` HTTP/1.1`
+// 的 14 字节，即整体 −8）就是：实测接受的请求行是 5615，被拒的是 27839。
+//
+// ⚠️ 这只是**已实测的最长值，不是服务端上限**：真实上限落在
+// [5623, 27846] 这个区间里，本采集的 5 个数据点无法把它再收窄
+// （nginx 默认的 8k 就落在区间内，但无证据）。所以它只配当预警信号。
+const LongestAcceptedURLLen = 5623
+
+// URLTooLongHint 在 URL 超过已实测的接受值时给出预警文案；否则返回空串。
+//
+// urlLen 是**完整 URL**（含 scheme+host）的字节数，即 `len(ex.URL)`。
+func URLTooLongHint(urlLen int) string {
+	if urlLen <= LongestAcceptedURLLen {
+		return ""
+	}
+	return fmt.Sprintf("URL 长 %d 字节，超过已实测的接受值（%d）⟹ 大概率被网关判 414（`har#3` 抓包）",
+		urlLen, LongestAcceptedURLLen)
 }
 
 // extractMsg 从 `{"code":0,"msg":"..."}` 形态里取 msg。
@@ -299,7 +363,7 @@ func itemKey(item json.RawMessage) string {
 
 // ForgeDefaults 是找不到真实样本时，伪造 captchaVerifyParam 所用的字段长度。
 //
-// 长度取自 2026-09-14 抓包里的真实值量级，目的是让伪造值在长度维度上
+// 长度取自 `har#1`/`har#2` 里的真实值量级，目的是让伪造值在长度维度上
 // 与真值一致，避免被「长度异常」这一条单独拒掉。
 var ForgeDefaults = struct {
 	CertifyIDLen   int
@@ -425,24 +489,32 @@ func RedactHeaders(h map[string][]string) map[string]string {
 	return out
 }
 
-// MaskID 保留前 4 位，其余打码。
+// MaskID 是报告里学号的打码形式：只留前 2 位与最后 1 位，中间一律打码。
+//
+// 例：`24000000` → `24*****0`。
+//
+// ⚠️ 这**不是安全边界**：报告与终端日志都在 gitignore 里（`probe-results/`），
+// 本来就不需要打码。它只是顺手把「从草稿往 docs/ 抄」这一步变省事
+// （docs/signin-probe.md §4.4 的判据：会进 git 的内容才需要打码）。
 func MaskID(id string) string {
-	if len(id) <= 4 {
+	r := []rune(id)
+	if len(r) <= 3 {
 		return id
 	}
-	return id[:4] + strings.Repeat("*", len(id)-4)
+	return string(r[:2]) + strings.Repeat("*", len(r)-3) + string(r[len(r)-1:])
 }
 
-// MaskName 只留姓氏，其余一律打成两个星号。
+// MaskName 用固定的示例假名替掉真实姓名。
 //
-// 按 rune 处理，不会把中文名字切成乱码；星号数量固定，不额外泄露名字有几个字。
-// 脚本只打这一处姓名（登录成功那条日志），报告里本来就只写打码后的学号。
+// 只留姓氏（`张**`）也会泄露「是哪个姓的老师/同学」，所以这里**一位都不留**，
+// 整个换成张三这样的占位名。空串原样返回，方便调用方区分「没有姓名」与「姓名已打码」。
+//
+// ⚠️ 同 MaskID：这**不是安全边界**，报告与终端日志都不进 git。
 func MaskName(name string) string {
-	name = strings.TrimSpace(name)
-	if name == "" {
+	if strings.TrimSpace(name) == "" {
 		return ""
 	}
-	return string([]rune(name)[0]) + "**"
+	return "张三"
 }
 
 var (

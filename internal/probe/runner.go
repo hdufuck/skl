@@ -72,6 +72,10 @@ type Config struct {
 	GateTimeout        time.Duration
 	HookWait           time.Duration
 	ContinueAfterWrite bool
+
+	// GenuineAttempts 是真值档最多跑几次（每次重取一个新 captchaVerifyParam）。
+	// 0 表示默认值（3）：`har#3` 抓包里三次提交才成功一次。
+	GenuineAttempts int
 }
 
 const (
@@ -79,6 +83,9 @@ const (
 	defaultCaptchaDeadline = 23 * time.Second
 	defaultGateTimeout     = 5 * time.Second
 	defaultHookWait        = 10 * time.Second
+	// defaultGenuineAttempts 默认让真值档最多跑 3 次：`har#3` 抓包里
+	// 第 1、2 次都死在网关（414），第 3 次才真正到应用并成功。
+	defaultGenuineAttempts = 3
 )
 
 func (c Config) ladderDeadline() time.Duration {
@@ -107,6 +114,22 @@ func (c Config) hookWait() time.Duration {
 		return c.HookWait
 	}
 	return defaultHookWait
+}
+
+// rungAttempts 返回该档允许的往返次数（含最后一次）。
+//
+// 只有真值档会「换一个新 captchaVerifyParam 重来」：`har#3` 抓包里三次提交
+// 才成功一次，前两次分别是 TRACELESS 的 data 膨胀到 25 KB 被网关判 `414`、
+// 以及人机判定 `false`（`F001`）；两种情况换新参数都大概率能过——官方 SDK
+// 自己也是这么做的（`F001` 后自动 `reInitCaptcha`，重取参数后一次成功）。
+func (c Config) rungAttempts(rung RungID) int {
+	if rung != RungCaptchaGenuine {
+		return 1
+	}
+	if c.GenuineAttempts > 0 {
+		return c.GenuineAttempts
+	}
+	return defaultGenuineAttempts
 }
 
 func (c Config) now() time.Time {
@@ -259,21 +282,51 @@ func (cfg Config) runRung(ctx context.Context, rung RungID, prev Snapshot) Entry
 
 	began := cfg.now()
 
-	// `200 + 空 body` 已证实多为 skl-ticket 重放被拒：换一个新的 ticket
-	// 重发一次，不计入尝试次数（库为每次请求都生成新 ticket）。
+	max := cfg.rungAttempts(rung)
 	var (
 		ex     *Exchange
 		runErr error
+		hints  hintSet
 	)
-	for attempt := 0; attempt < 2; attempt++ {
-		cfg.Recorder.Reset()
-		runErr = cfg.execute(ctx, rung)
-		ex = cfg.Recorder.Last()
-		if attempt == 0 && isRetryableEmptyBody(ex) {
-			entry.Note = appendNote(entry.Note, "200 空 body：换新 skl-ticket 重发一次（不计入尝试次数）")
-			continue
+	// lastGood 是最后一次「拿到了真实响应」的往返。重取参数的那次重试如果以
+	// 传输错误/超时收场，不能让它盖掉前面那次可判读的结果。
+	var (
+		lastGood      *Exchange
+		lastGoodHints hintSet
+	)
+	for i := range max {
+		if i > 0 && ctx.Err() != nil {
+			entry.Note = appendNote(entry.Note, "重取参数的预算已耗尽，停止重试")
+			break
 		}
-		break
+
+		cur, err := cfg.exchange(ctx, rung, &entry.Note)
+		body := ""
+		if cur != nil {
+			body = strings.TrimSpace(string(cur.Body))
+		}
+		curHints := hintsFrom(rung, body)
+
+		retry := retryWithFreshParamReason(rung, cur, curHints)
+		entry.Attempts = append(entry.Attempts, newAttempt(cur, body, retry))
+
+		if cur != nil && cur.Err == nil && cur.Status != 0 {
+			lastGood, lastGoodHints = cur, curHints
+		}
+		ex, runErr, hints = cur, err, curHints
+
+		if retry == "" {
+			break
+		}
+		if i+1 >= max {
+			entry.Note = appendNote(entry.Note,
+				fmt.Sprintf("本次失败属于「值得换新 captchaVerifyParam 重取」那类，但已用满 %d 次上限，停止重试", max))
+			break
+		}
+		entry.Note = appendNote(entry.Note, retry)
+	}
+	if lastGood != nil {
+		ex, hints = lastGood, lastGoodHints
 	}
 	entry.Duration = cfg.now().Sub(began).String()
 
@@ -286,12 +339,14 @@ func (cfg Config) runRung(ctx context.Context, rung RungID, prev Snapshot) Entry
 		if ex.Err != nil {
 			entry.Err = ex.Err.Error()
 		}
+		if hint := URLTooLongHint(len(ex.URL)); hint != "" {
+			entry.Note = appendNote(entry.Note, hint)
+		}
 	}
 	if runErr != nil && entry.Err == "" {
 		entry.Err = runErr.Error()
 	}
-
-	hints := hintsFrom(rung, entry.Body)
+	entry.CaptchaVerifyCode = hints.captchaVerifyCode
 
 	after, rbErr := cfg.ReadBack(ctx)
 	if rbErr != nil {
@@ -311,10 +366,72 @@ func (cfg Config) runRung(ctx context.Context, rung RungID, prev Snapshot) Entry
 		AnalyzeCode:         hints.analyzeCode,
 		HasAnalyzeCode:      hints.hasAnalyzeCode,
 		CaptchaVerifyResult: hints.cvr,
+		CaptchaVerifyCode:   hints.captchaVerifyCode,
 		CheckCodeDtoLen:     hints.dtoLen,
 	})
 	entry.Evidence = entry.Verdict.Evidence()
 	return entry
+}
+
+// exchange 发一次请求；`200 + 空 body` 已证实多为 skl-ticket 重放被拒，
+// 这种情况换一个新的 ticket 重发一次，不计入真值档的重取预算。
+func (cfg Config) exchange(ctx context.Context, rung RungID, note *string) (*Exchange, error) {
+	var (
+		ex     *Exchange
+		runErr error
+	)
+	for attempt := range 2 {
+		cfg.Recorder.Reset()
+		runErr = cfg.execute(ctx, rung)
+		ex = cfg.Recorder.Last()
+		if attempt == 0 && isRetryableEmptyBody(ex) {
+			*note = appendNote(*note, "200 空 body：换新 skl-ticket 重发一次（不计入尝试次数）")
+			continue
+		}
+		break
+	}
+	return ex, runErr
+}
+
+// retryWithFreshParamReason 报告是否值得换一个新的 captchaVerifyParam 重来。
+//
+// 只有真值档才重取：重取要重走一遍浏览器取参，有成本；而其余档的参数本来就
+// 是伪造/缺失的，重取没有意义。
+func retryWithFreshParamReason(rung RungID, ex *Exchange, hints hintSet) string {
+	if rung != RungCaptchaGenuine || ex == nil || ex.Err != nil {
+		return ""
+	}
+	switch {
+	case ex.Status == http.StatusRequestEntityTooLarge || ex.Status == http.StatusRequestURITooLong:
+		return fmt.Sprintf("HTTP %d：请求行长 %d 字节，被网关拒绝（未达应用）⟹ 换一个新参数重取",
+			ex.Status, len(ex.URL))
+	case ex.Status == http.StatusOK && isCaptchaRejected(hints):
+		return "人机判定为 false ⟹ 换一个新参数重取（官方 SDK 在 F001 后也是这样 reInitCaptcha 的）"
+	}
+	return ""
+}
+
+// isCaptchaRejected 报告这次响应是否明确指向人机层失败。
+//
+// 直接复用判读层，避免「什么算人机失败」在重试决策与结论两处各写一遍。
+func isCaptchaRejected(hints hintSet) bool {
+	return Classify(ClassifyInput{
+		Rung:                RungCaptchaGenuine,
+		Status:              http.StatusOK,
+		Body:                []byte("{\"x\":1}"),
+		CaptchaVerifyResult: hints.cvr,
+		CaptchaVerifyCode:   hints.captchaVerifyCode,
+	}) == VerdictCaptchaRejected
+}
+
+// newAttempt 把一次往返汇总成报告里的一条记录。
+func newAttempt(cur *Exchange, body, retry string) Attempt {
+	att := Attempt{Body: body, Retry: retry}
+	if cur != nil {
+		att.Status = cur.Status
+		att.URLLen = len(cur.URL)
+	}
+	return att
 }
 
 // isRetryableEmptyBody 报告一次往返是否是「200 + 空 body」。
@@ -393,10 +510,11 @@ func (cfg Config) execute(ctx context.Context, rung RungID) error {
 }
 
 type hintSet struct {
-	analyzeCode    int
-	hasAnalyzeCode bool
-	cvr            *bool
-	dtoLen         int
+	analyzeCode       int
+	hasAnalyzeCode    bool
+	cvr               *bool
+	captchaVerifyCode string
+	dtoLen            int
 }
 
 // hintsFrom 从响应体里提取判读所需的字面量。
@@ -418,12 +536,14 @@ func hintsFrom(rung RungID, body string) hintSet {
 	}
 
 	var env struct {
-		CVR json.RawMessage `json:"captchaVerifyResult"`
-		DTO json.RawMessage `json:"checkCodeDto"`
+		CVR  json.RawMessage `json:"captchaVerifyResult"`
+		Code string          `json:"captchaVerifyCode"`
+		DTO  json.RawMessage `json:"checkCodeDto"`
 	}
 	if err := json.Unmarshal(payload, &env); err != nil {
 		return hs
 	}
+	hs.captchaVerifyCode = env.Code
 	if len(env.CVR) > 0 {
 		var b bool
 		if err := json.Unmarshal(env.CVR, &b); err == nil {

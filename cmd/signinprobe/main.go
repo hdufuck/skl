@@ -54,6 +54,7 @@ type options struct {
 	captchaDeadline time.Duration
 	gateTimeout     time.Duration
 	hookWait        time.Duration
+	genuineAttempts int
 }
 
 func run() error {
@@ -79,6 +80,8 @@ func run() error {
 	fs.DurationVar(&opt.captchaDeadline, "captcha-deadline", 23*time.Second, "真值档的墙钟预算")
 	fs.DurationVar(&opt.gateTimeout, "gate-timeout", 5*time.Second, "写入后交互闸的倒计时")
 	fs.DurationVar(&opt.hookWait, "hook-wait", 10*time.Second, "等待手机 HAR 上报的时长")
+	fs.IntVar(&opt.genuineAttempts, "genuine-attempts", 3,
+		"真值档最多跑几次（每次重取一个新 captchaVerifyParam；`har#3` 抓包里三次提交才成功一次）")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
@@ -208,8 +211,8 @@ func run() error {
 		return fmt.Errorf("签到码 %q 不是 4 位数字", code)
 	}
 
-	logf("T0=%s 开始阶梯（Ladder≤%s / 真值≤%s）", time.Now().Format("15:04:05"),
-		opt.ladderDeadline, opt.captchaDeadline)
+	logf("T0=%s 开始阶梯（Ladder≤%s / 真值≤%s，真值档最多 %d 次）", time.Now().Format("15:04:05"),
+		opt.ladderDeadline, opt.captchaDeadline, opt.genuineAttempts)
 
 	prompter := &cliPrompter{in: in, out: os.Stderr}
 	rep, err := probe.Run(ctx, probe.Config{
@@ -230,6 +233,7 @@ func run() error {
 		CaptchaDeadline:    opt.captchaDeadline,
 		GateTimeout:        opt.gateTimeout,
 		HookWait:           opt.hookWait,
+		GenuineAttempts:    opt.genuineAttempts,
 		ContinueAfterWrite: opt.keepWrites,
 	})
 	if err != nil {

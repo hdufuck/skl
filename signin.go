@@ -1,6 +1,7 @@
 package skl
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -34,17 +35,48 @@ type SignInRequest struct {
 
 // SignInResult 是 `POST /api/ali-nvc/captcha-verify` 的响应。
 //
-// 字段名 `captchaVerifyResult` / `checkCodeDto` 取自 skl 前端源码
-// （sign/in 页面读的是 `g.captchaVerifyResult` 与 `g.checkCodeDto`），
-// **不是** 抓包结论：两份 HAR 里的两次签到都返回
-// `401 {"code":0,"msg":"签到码不存在，不要玩我"}`，未观察到成功响应。
-// 因此两者内部形态保持 RawMessage 透出，未做字段级建模。
+// 字段名与形态取自 `har#3` 的浏览器抓包（一份**成功**样本，`200`）：
 //
-// 前端拿到 checkCodeDto 后存进 store 并跳转 /sign/in/detail。
+//	{"captchaVerifyResult":true,"captchaVerifyCode":"T001","checkCodeDto":{…17 个字段…}}
+//
+// 同一个接口还有另外两种结局，都不是 `401`：
+//
+//	200 {"captchaVerifyResult":false,"captchaVerifyCode":"F001"}  人机层单独拒签
+//	414 text/plain "URI too long"                                   网关拒了超长请求行
+//
+// 因此**不能用状态码判断成败**，用 [SignInResult.OK]。字段值保持 RawMessage /
+// 原生类型透出，不做结构性重命名，以保留服务端原始形状。
+//
+// 前端拿到 `checkCodeDto` 后存进 store 并跳转 `/sign/in/detail`。
 type SignInResult struct {
+	// CaptchaVerifyResult 是服务端对本次人机凭证的判定，**严格 `true`** 才算过。
 	CaptchaVerifyResult json.RawMessage `json:"captchaVerifyResult"`
-	CheckCodeDto        json.RawMessage `json:"checkCodeDto"`
-	Response            *Response       `json:"-"`
+	// CaptchaVerifyCode 是它的文字版：成功 `T001`，人机失败 `F001`。
+	// 该字段在前端产物里不存在（服务端专有），`har#3` 首次观察到。
+	CaptchaVerifyCode string `json:"captchaVerifyCode"`
+	// CheckCodeDto 是成功时的考勤记录详情；失败时整个键不存在（nil）。
+	CheckCodeDto json.RawMessage `json:"checkCodeDto"`
+	Response     *Response       `json:"-"`
+}
+
+// OK 报告这次签到是否成功。
+//
+// 判据是 `har#3` 抓包实测的两条**同时**成立：
+//   - `captchaVerifyResult` 严格为 `true`；
+//   - `checkCodeDto` 非空（成功才带这个键，人机失败时整个键不存在）。
+//
+// [SignIn] **不会**把「`200` + `captchaVerifyResult:false`」当错误返回，
+// 所以调用方必须靠它（或自己看字段）区分「签到成功」与「人机被拒」。
+func (r *SignInResult) OK() bool {
+	if r == nil || len(r.CaptchaVerifyResult) == 0 {
+		return false
+	}
+	var passed bool
+	if err := json.Unmarshal(r.CaptchaVerifyResult, &passed); err != nil || !passed {
+		return false
+	}
+	dto := bytes.TrimSpace(r.CheckCodeDto)
+	return len(dto) > 0 && !bytes.Equal(dto, []byte("null"))
 }
 
 // SignIn 通过 `POST /api/ali-nvc/captcha-verify` 完成签到。
@@ -85,7 +117,14 @@ func (c *Client) SignIn(ctx context.Context, req SignInRequest) (*SignInResult, 
 		"t":                  {strconv.FormatInt(time.Now().UnixMilli(), 10)},
 	}
 
-	resp, err := c.Post(ctx, PathSignInCaptchaVerify, query, nil)
+	resp, err := c.Do(ctx, &Request{
+		Method: http.MethodPost,
+		Path:   PathSignInCaptchaVerify,
+		Query:  query,
+		// 参数全在 query 里、body 为空，但官方请求仍带 form 头
+		// （`har#3` 抓包第 101 条）——必须与之逐字节一致。
+		ContentType: ContentTypeFormURLEncoded,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +282,7 @@ func (c *Client) SignInLegacyAnalyze(ctx context.Context, req AnalyzeRequest) (*
 		return nil, err
 	}
 
-	payload, err := unwrapJSONP(resp.Body, callback)
+	payload, err := unwrapJSONP(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("skl: 解析 %s 的 JSONP 响应失败: %w", PathSignInAnalyze, err)
 	}
@@ -341,8 +380,9 @@ func newJSONPCallback() string {
 
 // unwrapJSONP 去掉 JSONP 外壳，返回纯 JSON。
 //
-// 服务端也可能直接返回 JSON（当请求被拒时），两种都能处理。
-func unwrapJSONP(body []byte, callback string) ([]byte, error) {
+// 服务端也可能直接返回 JSON（当请求被拒时），两种都能处理；外壳里的回调名
+// 不做校验（服务端可能回一个与请求不同的名字），所以这里不需要它。
+func unwrapJSONP(body []byte) ([]byte, error) {
 	trimmed := strings.TrimSpace(string(body))
 
 	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {

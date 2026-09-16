@@ -528,3 +528,188 @@ func TestRunRecordsRawExchange(t *testing.T) {
 		t.Fatalf("URL 未记录: %s", checkIn.URL)
 	}
 }
+
+// 以下两个响应体取自 `har#3` 的浏览器抓包（HAR 第 98 / 101 条）的形状，
+// 值一律替换为占位符：真实的学号、教师姓名与课程标识不入库。
+const (
+	captchaRejectedF001 = `{"captchaVerifyResult":false,"captchaVerifyCode":"F001"}`
+	captchaSuccessT001  = `{"captchaVerifyResult":true,"captchaVerifyCode":"T001",` +
+		`"checkCodeDto":{"code":"1234","courseId":"COURSE-ID","courseName":"示例课程",` +
+		`"courseSchemaId":"SCHEMA-ID","expiresDate":"2006-01-01T00:00:20.000Z","expiresIn":20000,` +
+		`"id":"record-id","latitude":30.00000000000000,"longitude":120.00000000000000,` +
+		`"recordDate":"2025-12-31T16:00:00.000Z","requestLatitude":30.00001,` +
+		`"requestLongitude":120.00001,"studentId":"24000000","teachName":"张三",` +
+		`"teacherId":"000**","totalCheckInRecord":null,"week":1}}`
+)
+
+// `har#3` 抓包第 6/10 条：请求行超长时是网关应答 414，应用层没收到。
+const uriTooLongBody = "URI too long\n"
+
+// 真值档在「网关拒了超长请求行」之后必须换一个新参数重取；否则一次 414 就会
+// 把整个窗口浪费掉（抓包里前两次提交都死在这里）。
+func TestRunGenuineRetriesAfterURITooLong(t *testing.T) {
+	var genuineCalls atomic.Int32
+	backend := &fakeBackend{
+		Analyze: func(string) (int, int) { return 200, 800 },
+		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
+		Captcha: func(param, _ string) (int, string, bool) {
+			if param != "GENUINE" {
+				return 401, codeRejectedBody, false
+			}
+			if genuineCalls.Add(1) == 1 {
+				return 414, uriTooLongBody, false
+			}
+			return 200, captchaSuccessT001, true
+		},
+	}
+	client, rec, _ := newTestClient(t, backend)
+
+	src := &fakeCaptchaSource{value: "GENUINE"}
+	cfg := baseConfig(client, rec)
+	cfg.Captcha = src
+
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	genuine := rep.Entries[4]
+	if genuine.Verdict != VerdictSuccess {
+		t.Fatalf("真值档判读 = %s, want success（414 后应重取成功）", genuine.Verdict)
+	}
+	if genuine.Status != 200 {
+		t.Fatalf("最终记录的状态码 = %d, want 200（不能被首次 414 覆盖）", genuine.Status)
+	}
+	if src.used != 2 {
+		t.Fatalf("取参次数 = %d, want 2（必须重取一个新参数）", src.used)
+	}
+	if len(genuine.Attempts) != 2 {
+		t.Fatalf("往返次数 = %d, want 2", len(genuine.Attempts))
+	}
+	if genuine.Attempts[0].Status != 414 || genuine.Attempts[0].Retry == "" {
+		t.Fatalf("首次往返应记为 414 且带重试原因: %+v", genuine.Attempts[0])
+	}
+	if genuine.Attempts[1].Status != 200 || genuine.Attempts[1].Retry != "" {
+		t.Fatalf("末次往返应是 200 且不再重试: %+v", genuine.Attempts[1])
+	}
+	if !strings.Contains(genuine.Note, "414") {
+		t.Fatalf("备注里应说明 414 重取: %q", genuine.Note)
+	}
+	if genuine.CaptchaVerifyCode != "T001" {
+		t.Fatalf("captchaVerifyCode = %q, want T001", genuine.CaptchaVerifyCode)
+	}
+}
+
+// 抓包第 98→101 条的原样场景：有效签到码 + 人机判定 false（F001）→
+// SDK 自动 reInitCaptcha，重取参数后成功。探针必须做同样的事。
+func TestRunGenuineRetriesAfterCaptchaRejected(t *testing.T) {
+	var genuineCalls atomic.Int32
+	backend := &fakeBackend{
+		Analyze: func(string) (int, int) { return 200, 800 },
+		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
+		Captcha: func(param, _ string) (int, string, bool) {
+			if param != "GENUINE" {
+				return 401, codeRejectedBody, false
+			}
+			if genuineCalls.Add(1) == 1 {
+				return 200, captchaRejectedF001, false
+			}
+			return 200, captchaSuccessT001, true
+		},
+	}
+	client, rec, _ := newTestClient(t, backend)
+
+	src := &fakeCaptchaSource{value: "GENUINE"}
+	cfg := baseConfig(client, rec)
+	cfg.Captcha = src
+
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	genuine := rep.Entries[4]
+	if genuine.Verdict != VerdictSuccess {
+		t.Fatalf("真值档判读 = %s, want success（F001 后应重取）", genuine.Verdict)
+	}
+	if src.used != 2 {
+		t.Fatalf("取参次数 = %d, want 2", src.used)
+	}
+	if len(genuine.Attempts) != 2 {
+		t.Fatalf("往返次数 = %d, want 2", len(genuine.Attempts))
+	}
+	// 末次记录的是成功那次响应，F001 只留在 attempts 里。
+	if !strings.Contains(genuine.Body, `"captchaVerifyCode":"T001"`) {
+		t.Fatalf("最终响应体应取成功那次: %q", genuine.Body)
+	}
+	if !strings.Contains(genuine.Attempts[0].Body, "F001") {
+		t.Fatalf("首次往返应留档 F001: %+v", genuine.Attempts[0])
+	}
+}
+
+// 判读已经明确（例如签到码不存在）时不该浪费窗口去重取参数。
+func TestRunGenuineDoesNotRetryWhenDecidable(t *testing.T) {
+	backend := &fakeBackend{
+		Analyze: func(string) (int, int) { return 200, 800 },
+		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
+		Captcha: func(string, string) (int, string, bool) { return 401, codeRejectedBody, false },
+	}
+	client, rec, _ := newTestClient(t, backend)
+
+	src := &fakeCaptchaSource{value: "GENUINE"}
+	cfg := baseConfig(client, rec)
+	cfg.Captcha = src
+
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if src.used != 1 {
+		t.Fatalf("取参次数 = %d, want 1（不该白重取）", src.used)
+	}
+	if v := rep.Entries[4].Verdict; v != VerdictCodeRejected {
+		t.Fatalf("判读 = %s, want code_rejected", v)
+	}
+	if len(rep.Entries[4].Attempts) != 1 {
+		t.Fatalf("往返次数 = %d, want 1", len(rep.Entries[4].Attempts))
+	}
+}
+
+// GenuineAttempts=1 时退化成「只打一枪」，并且 414 仍要单独归因（不是不可归因）。
+func TestRunGenuineAttemptsBudgetAndURITooLongVerdict(t *testing.T) {
+	backend := &fakeBackend{
+		Analyze: func(string) (int, int) { return 200, 800 },
+		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
+		Captcha: func(param, _ string) (int, string, bool) {
+			if param != "GENUINE" {
+				return 401, codeRejectedBody, false
+			}
+			return 414, uriTooLongBody, false
+		},
+	}
+	client, rec, _ := newTestClient(t, backend)
+
+	src := &fakeCaptchaSource{value: "GENUINE"}
+	cfg := baseConfig(client, rec)
+	cfg.Captcha = src
+	cfg.GenuineAttempts = 1
+
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	genuine := rep.Entries[4]
+	if src.used != 1 {
+		t.Fatalf("取参次数 = %d, want 1", src.used)
+	}
+	if genuine.Verdict != VerdictURITooLong {
+		t.Fatalf("判读 = %s, want uri_too_long（网关拒绝请求行，不是 unattributable）", genuine.Verdict)
+	}
+	if genuine.Status != 414 {
+		t.Fatalf("状态码 = %d, want 414", genuine.Status)
+	}
+	// 重试预算耗尽时给出可读原因，而不是静默停在 414 上。
+	if !strings.Contains(genuine.Note, "上限") {
+		t.Fatalf("备注应说明未重取的原因（预算上限）: %q", genuine.Note)
+	}
+}

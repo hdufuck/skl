@@ -41,9 +41,10 @@ Reqable 手机 App 有两种模式，**上报服务器要配在「流量真正�
 | 判据 | 强度 |
 | --- | --- |
 | 阶梯中「未携带真凭证」的档位**写入了记录** | **强**（唯一的干净归因来源） |
-| 响应体明确指向人机层（`captchaVerifyResult===false`、文案含「人机」） | **强** |
+| 响应体明确指向人机层（`captchaVerifyResult===false`、`captchaVerifyCode==="F001"`、文案含「人机」） | **强** |
 | 响应体明确指向参数层（活路径 `400` + 参数缺失/非法） | **强** |
 | 真值档（官方 SDK 参数 + 库 `SignIn`）成功 | **强**（证明库的封装路径可用） |
+| `414` + `text/plain` `URI too long`（带 `X-Kong-Response-Latency`） | **强指网关**：请求行超长，应用层没收到 —— 既不是人机层也不是参数层，必须单独判。`413` 同类但未实测 |
 | 遗留端点 `/checkIn/code-check-in`、`/ali-nvc/check-code-analyze` 成功 | 强（证明不强制）；**失败不可解释**（单边证据） |
 | 本机发出的探针失败 | **弱**：可能是客户端指纹/WAF 导致，不足以单独定论（见 ADR 0002） |
 | `401 签到码不存在` | **无**：签到码校验先于风控校验 |
@@ -65,30 +66,45 @@ Reqable 手机 App 有两种模式，**上报服务器要配在「流量真正�
 
 ### 1.2 `captchaVerifyCallback` 契约 📖 + ✅
 
-`/sign/in` 路由懒加载 `assets/index-new-COcfVClM.js`，其初始化原文：
+`/sign/in` 路由懒加载 `assets/index-new-dX4pM4CL.js`（**`har#3` 抓包的版本**；
+本手册早期引的 `index-new-COcfVClM.js` 已被上游换掉），其初始化原文：
 
 ```js
 window.initAliyunCaptcha({
   SceneId: "2q42bw25", prefix: "cr5a57", mode: "popup",
   element: "#captcha-container", button: "#captcha-trigger-btn",
-  captchaVerifyCallback: R, onBizResultCallback: L, language: "cn"
+  captchaVerifyCallback: R, onBizResultCallback: L,
+  getInstance: a => { k.value = a },
+  slideStyle: { width: Math.min(360, window.innerWidth - 40), height: 50 },
+  language: "cn"
 });
 
 const R = async a => {
-  const i = { captchaVerifyParam: a, userid: B.value?.id, code: s.value,
-              latitude: u.value, longitude: d.value, t: Date.now() };
-  const g = (await X.post("/ali-nvc/captcha-verify", null, { params: i })).data;
-  return { captchaResult: g.captchaVerifyResult, bizResult: true };
+  try {
+    const i = { captchaVerifyParam: a, userid: B.value?.id, code: s.value,
+                latitude: u.value, longitude: d.value, t: Date.now() };
+    const g = (await X.post("/ali-nvc/captcha-verify", null, { params: i })).data;
+    g.checkCodeDto && f.setSignDetail(g.checkCodeDto), Z.closeToast();
+    return { captchaResult: g.captchaVerifyResult, bizResult: true };
+  } catch (e) {
+    // 失败路径：把 msg 弹 toast，并告诉 SDK「人机没问题、业务失败」
+    return { captchaResult: true, bizResult: false };
+  }
 };
+const L = a => { a && z.replace("/sign/in/detail") };
 ```
 
 要点：
 
 - 页面拿到的回调入参 `a` **原样**作为 `captchaVerifyParam` 提交，不做任何加工 ✅。
-- `captchaVerifyCallback(captchaVerifyParam: string, next: Function)`；
-  也可 `return {captchaResult, bizResult}`（真实页面用 return）✅。
+- 与早期版本相比多了 `getInstance` 与 `slideStyle` 两个键（前者是取参就绪信号，
+  见附录 A 的踩坑）；`catch` 分支返回 `{true, false}` 而不是 `{false, true}`。
+- `onBizResultCallback(true)` **只在 `captchaVerifyResult === true` 时**才被 SDK 调用
+  ⟹ 跳 `/sign/in/detail` 的条件就是「服务端判 true」（不是 HTTP 200）。
+  收到 `false` 时 SDK 会 `reInitCaptcha` 重开人机验证 —— 抓包第 98→101 条
+  就是「`F001` → 重开 → 再提交 → `T001` 成功」。
 - `{true, undefined|true}` = 成功；`{true, false}` = 失败 + `reInitCaptcha`；
-  `false`/`undefined` = 提示 + `reInitCaptcha` 📖。
+  `false`/`undefined` = 提示 + `reInitCaptcha` 📖（分支表见 §3 末尾）。
 - `onFallback` 给的降级参数**没有 `data`**，不要当正常参数用 ⚠️。
 
 ### 1.3 参数形状与生命周期
@@ -125,14 +141,21 @@ const R = async a => {
 风险 ⚠️：`TRACELESS` 是风控评分结果，会随 IP/时间/频次/设备指纹变化；
 阿里云有 `F024`「检测到自动化脚本模拟点击、滑动」，自动点击理论上可命中。
 
-### 1.5 窗口长度：很可能 ~300s ✅（推翻 20–30s 直觉）
+### 1.5 窗口长度：实测可以只有 **20 秒** ✅
 
 教师端生成签到码**没有有效期下拉**；前端兜底值是 **300 秒**、上限 3600 秒，
-真实值来自后端 `expiresIn`/`expiresDate`（`POST /checkIn/create-code`，
-`expiresIn` 实际传的是 `Date.now()`，命名疑似历史遗留）。
+真实值来自后端 `expiresIn`/`expiresDate`（`POST /checkIn/create-code`）。
 前端解析函数把 ≤300 当「秒」、≤300000 当「毫秒」、更大当「时间戳」📖。
 
-⟹ 脚本仍按 **30s 墙钟**设硬闸（最坏情况保守），但真实窗口大概率宽裕得多。
+**`har#3` 的浏览器抓包给出了第一个实测值**：`checkCodeDto.expiresIn=20000`、
+`expiresDate=10:32:00.685Z`，反推签到码创建于 `10:31:40.685Z`，成功提交于
+`10:31:49.900Z` —— 学生只剩 **10.8 秒**，中间还被人机拒了一次重来。
+
+⟹ `expiresIn` 是**时长（毫秒）**，不是时间戳（旧文档此处写反了）。
+⟹ **不能再假设窗口宽裕**：脚本的默认预算是 `8s（阶梯）+ 23s（真值档）= 31s`，
+比一个 20 秒的窗口还长。窗口前按 `--ladder-deadline` / `--captcha-deadline`
+自己收紧（例如 `4s + 12s`），或先把真值档的取参链路演练到稳定。
+真值档现在默认最多跑 3 次（每次重取一个新 `captchaVerifyParam`），见第 2 节。
 
 ## 2. 角色分工与阶梯
 
@@ -152,16 +175,41 @@ const R = async a => {
 | 2 | `code-check-in` | `GET /checkIn/code-check-in`，带定位 | 无 |
 | 3 | `captcha-verify-missing` | `POST /ali-nvc/captcha-verify` | **缺失** |
 | 4 | `captcha-verify-forged` | 同上 | **伪造**（结构合法、等长） |
-| 5 | `captcha-verify-genuine` | 同上，走库的 `SignIn` | 官方 SDK **真值** |
+| 5 | `captcha-verify-genuine` | 同上，走库的 `SignIn` | 官方 SDK **真值**（失败则换新参数，最多 3 次） |
 
 ### 2.1 时间预算（T0 = 签到码输入完成）
 
 | 相位 | 预算 | 超时行为 |
 | --- | --- | --- |
 | 档 1–4 | ≤ 8s | 跳过剩余、继续 |
-| 档 5（浏览器取参 + 提交） | ≤ 23s | 放弃浏览器、优先保手机 |
+| 档 5（浏览器取参 + 提交，含最多 3 次重取） | ≤ 23s | 放弃浏览器、优先保手机 |
 | 手机官方签到 | ≥ 7s | — |
 | 等 Reqable 上报 | ≤ 10s | 记 `hookMissing: true`，不阻塞 |
+
+> ⚠️ 上面的默认值合计 **31s**，而 `har#3` 实测过一个 **20s** 的窗口（见 1.5）。
+> 真窗口比 31s 短时，靠 `--ladder-deadline` / `--captcha-deadline` 收紧；
+> 真值档的 `--genuine-attempts`（默认 3）也直接吃这段预算。
+
+### 2.0 真值档为什么要重取参数
+
+`har#3` 抓包的完整因果链（三段提交才成功一次）：
+
+| 提交 | `CaptchaType` | 参数总长 | 结果 |
+| --- | --- | --- | --- |
+| 第 6 条 | `TRACELESS` | 27998 | **`414 URI too long`**（网关，未达应用） |
+| 第 10 条 | `TRACELESS` | 26806 | **`414 URI too long`**，同上 |
+| 第 98 条 | `TRACELESS` | 4278 | `200 {"captchaVerifyResult":false,"captchaVerifyCode":"F001"}` |
+| **第 101 条** | **`CHECK_BOX`** | 4442 | **`200 T001` 成功** |
+
+两种失败换一个新参数都大概率能过（官方 SDK 自己也在 `F001` 后 `reInitCaptcha`），
+所以真值档现在**只在**这两种观测上重取：HTTP `414`（`413` 同类），或 `200` + 人机判定 false。
+前者是**长度彩票**（换一个参数的 `data` 会重掷一次），后者只是照做官方 SDK 的动作——
+`F001` 的成因至今不可归因（见第 5 节）。
+重取次数、每次的 URL 长度与失败原因都写进报告的 `attempts`。
+
+> 另：`CaptchaType` 是每次 `InitCaptcha` 由阿里云**现判**的，同一次会话里会变。
+> `har#3` 那次是 `TRACELESS` → `F001` → 升级成 `CHECK_BOX`（显式勾选）才成功。
+> **那个升级是浏览器路径的现象**；钉钉客户端侧一直是静默的。
 
 浏览器在 T0 前**已预热**（页面加载、SDK 初始化完成），T0 后只点一次触发按钮
 （≈2–5s 出参）。
@@ -182,6 +230,10 @@ const R = async a => {
 - T0 前的基线计入报告；每档之后再读一次，按 `id`（缺 `id` 时按内容哈希）求新增。
 - 已知局限：若手机先签、服务端又按「课程+日期+学生」去重，则本机成功档可能**看不到新增**。
   因此脚本同时在报告里保留**响应体判读**作为降级判据（低置信）。
+- ⚠️ 另一个局限：签到成功后的 UI **不读这个端点**，它读的是
+  `GET /api/checkIn/stu-course-check-in-count?courseId=<checkCodeDto.courseId>`
+  （`har#3` 抓包第 111 条，返回 `[{"rightCount":1,…}]`）。若某档写入后这里
+  的 diff 看不见新记录，拿 `checkCodeDto.courseId` 去那个端点人工对一下。
 
 判读表：
 
@@ -189,10 +241,11 @@ const R = async a => {
 | --- | --- | --- |
 | 无真凭证档写入记录 | `written_without_captcha` | 强 |
 | 真值档写入记录，或 `captchaVerifyResult===true` 且 `checkCodeDto` 非空 | `success` | 强 |
-| `captchaVerifyResult===false`、文案含「人机/滑块/验证码」 | `captcha_layer_rejected` | 强 |
+| `captchaVerifyResult===false`（或只有 `captchaVerifyCode==="F001"`）、文案含「人机/滑块/验证码」 | `captcha_layer_rejected` | 强 |
 | 活路径 `400` + 参数缺失/非法 | `param_layer_rejected` | 强 |
 | `401` 文案含「签到码」 | `code_rejected` | 无 |
 | `200` + 空 body | `empty_body`（换新 `skl-ticket` 重发一次，不计入尝试） | 无 |
+| `414` + `text/plain`（`URI too long`） | `uri_too_long`（**网关拒了请求行，应用层没收到**） | 强（指网关，非服务端策略）；`413` 同类未实测 |
 | 其它 | `unattributable` | 无 |
 
 ## 4. 操作手册
@@ -225,8 +278,9 @@ const R = async a => {
 ### 4.2 T0 流程
 
 ```bash
-go run ./cmd/signinprobe            # 默认：headless=new、hook :8080、30s 预算
+go run ./cmd/signinprobe            # 默认：headless=new、hook :8080、阶梯 8s + 真值 23s
 # 可选：--headed  --profile <目录>  --no-browser  --hook ""  --out probe-results
+#      --ladder-deadline 4s  --captcha-deadline 12s  --genuine-attempts 2
 ```
 
 补充说明：
@@ -293,11 +347,33 @@ T0 后的时序：
 
 ### 4.4 脱敏规则（照抄进提交物）
 
+**打码的范围就一条判据：会进 git 的内容才需要打码。**
+
+| 内容 | 会不会进 git | 要不要打码 |
+| --- | --- | --- |
+| `docs/**`、`README.md`、`*.go` 的注释 | 是 | **要**（含：人名、学号、课程、具体日期与钟点） |
+| `probe-results/**`、`*.har`、`.env`、`token.txt` | 否（均已 gitignore） | **不必**：报告草稿与终端日志保持原样即可 |
+| 终端日志（`logf` 打出来的那些） | 否 | **不必** |
+
+> 报告草稿（`probe-results/<时间戳>.md`）不做强制打码 —— 它只是本地草稿。
+> 但**从草稿往 `docs/` 抄的时候必须打码**，那一步才是会持久化的那一步。
+> 因此脚本里那层打码（`probe.MaskID` / `probe.MaskName`）是**顺手**，
+> 不是安全边界：真正的边界是「提交前对 git 里那份内容做一次检查」。
+
+提交前必查：
+
 - `X-Auth-Token`、`skl-ticket`、`Cookie`、`token=`、`sessionId` **永不粘贴**；
 - `deviceToken` 只留长度与前 20 字符；
 - `captchaVerifyParam` 的 `sceneId`/`certifyId` 可留，`data` 只留前 20 字符；
-- `*.har` 已在 `.gitignore`，`probe-results/` 同样 gitignore；
-  **只提交手动脱敏后的 markdown 片段**，不提交原始报告。
+- 人名、学号、课程名/`courseId`/`courseSchemaId`、**具体日期与钟点**一律不入库
+  —— 时间值用 Go 参考时间格式（`2006-01-02T15:04:05.000Z`）占位，
+  时序用相对偏移，文档里的采集出处用采集编号（`har#1`/`har#2`/`har#3`，
+  图例见 `doc.go` 的证据来源）。可照本文件所在的仓库自查：
+
+  ```bash
+  # 应在 docs/ README.md *.go 里零命中
+  git grep -nE '2026-0[0-9]|<真实课程名>|<真实学号>|<真实姓名>'
+  ```
 
 ### 4.5 落盘
 
@@ -313,8 +389,13 @@ T0 后的时序：
 
 | 项 | 原因 |
 | --- | --- |
+| **`CaptchaEnforcement`（人机是否强制）** | `har#3` 的采集**没有**「有效签到码 + 缺失 `captchaVerifyParam`」的尝试；只证明了「有效码 + 人机不通过」= `200 F001` |
+| `captchaVerifyParam` 一次性 / 有效期 | 5 个 `certifyId` 各用一次，无重放；只能确认 `InitCaptcha` 会把上次的 `certifyId` 带回去（`reInitCaptcha`） |
+| 人机判 `F001` 的成因 | 参数是真值（距 init 仅 4.25 s）却被人机拒；风控评分、UA 矛盾、前两次 414 都可能，**不可区分** |
+| 本次成功是否**真的写入**了记录 | 成功后的 `rightCount:1` 只在成功后读了一次，**无基线**；成功 + 跳转 `/sign/in/detail` 是强旁证而非写入证明 |
+| `414` 的确切阈值 | 只有 5 个数据点，可证 `5615 ≤ 请求行上限 < 27839`（字节）；`413` 未实测 |
 | 服务端是否校验 `t` | 需要专门探针，且不影响库的形态 |
-| `coordinate: 0` 的坐标系语义 | 需要教师端 `distance` 列 |
+| `coordinate: 0` 的坐标系语义 | 需要教师端 `distance` 列；且浏览器路径根本不传它（走 `navigator.geolocation`） |
 | `distance` 超限是否拒签 | 需伪造远端坐标，且已由项目所有者确认，无证据债 |
 | 遗留端点「失败」的归因 | 单边证据：成功才算证明；失败可能是请求形状本来就不对 |
 | 本机探针失败的因果归因 | 客户端指纹/WAF 与「服务端策略」不可区分（ADR 0002） |
@@ -369,6 +450,10 @@ T0 后的时序：
 | 实验 | 位置 | 结论 |
 | --- | --- | --- |
 | HAR 解析 | `skl.hdu.edu.cn_2026_09_14_10_50_57.har` | 参数在 query、body 空；`CaptchaType:"TRACELESS"` |
+| **成功签到样本** | `skl.hdu.edu.cn2.har`（`har#3` 浏览器） | **`200 {captchaVerifyResult:true, captchaVerifyCode:"T001", checkCodeDto:{17 字段}}`**；同一次采集里另有 `414×2` 与 `200 F001`。全文与字段表见 [`signin-success-sample.md`](./signin-success-sample.md) |
+| 请求形状 | 同上 | 空 body + `Content-Type: application/x-www-form-urlencoded`；`skl-ticket` 21 字符全部匹配 `[A-Za-z0-9_-]{21}`；`X-Auth-Token` = CAS `?token=` 的 UUID |
+| 窗口长度 | 同上 | `expiresIn=20000`（**20 秒**），不是 ~300s |
+| 人机形态升级 | 同上 | `TRACELESS` → `F001` → 同 `StaticPath` 升级为 `CHECK_BOX` → 成功（**浏览器路径特有**） |
 | 页面源码 | `assets/index-new-COcfVClM.js`（路由 `/sign/in`） | 回调契约与「原样透传」 |
 | SDK 源码 | `AliyunCaptcha.js` + 动态 chunk | `captchaVerifyCallback(param, next)` |
 | hook 截获 | 临时 chromedp 程序 | `__captchaHookOk=true`，参数 len≈1690 |

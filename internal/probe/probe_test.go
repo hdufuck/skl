@@ -111,6 +111,37 @@ func TestClassify(t *testing.T) {
 			in:   ClassifyInput{Rung: RungLegacyCheckIn, Status: 500, Body: []byte(`{"boom":1}`)},
 			want: VerdictUnattributable,
 		},
+		// `har#3` 抓包第 6/10 条：请求行超长时是**网关**（Kong 前置 nginx）
+		// 应答 `414 URI too long`（`text/plain`、无 CORS），应用层根本没收到。
+		// 必须单独成一类：TRACELESS 的 data 会膨胀到 25 KB 量级，这种拒绝
+		// 与「服务端策略」无关，不能归因成 unattributable。
+		{
+			name: "414 网关拒绝超长请求行",
+			in:   ClassifyInput{Rung: RungCaptchaGenuine, Status: 414, Body: []byte("URI too long\n")},
+			want: VerdictURITooLong,
+		},
+		{
+			name: "413 同类未实测也归到网关类",
+			in:   ClassifyInput{Rung: RungCaptchaGenuine, Status: 413, Body: []byte("URI too long\n")},
+			want: VerdictURITooLong,
+		},
+		// captchaVerifyCode 是 `har#3` 抓包新发现的字段：成功 T001 / 失败 F001。
+		// 它在 captchaVerifyResult 缺失时是唯一的判据。
+		{
+			name: "captchaVerifyCode=F001 指向人机层（无 captchaVerifyResult）",
+			in:   ClassifyInput{Rung: RungCaptchaGenuine, Status: 200, Body: []byte(`{"captchaVerifyCode":"F001"}`), CaptchaVerifyCode: "F001"},
+			want: VerdictCaptchaRejected,
+		},
+		{
+			name: "captchaVerifyCode=T001 且有 checkCodeDto",
+			in:   ClassifyInput{Rung: RungCaptchaGenuine, Status: 200, Body: []byte(`{"captchaVerifyCode":"T001","checkCodeDto":{"id":"x"}}`), CaptchaVerifyCode: "T001", CheckCodeDtoLen: 12},
+			want: VerdictSuccess,
+		},
+		{
+			name: "未知 captchaVerifyCode 不硬判",
+			in:   ClassifyInput{Rung: RungCaptchaGenuine, Status: 200, Body: []byte(`{"captchaVerifyCode":"X999"}`), CaptchaVerifyCode: "X999"},
+			want: VerdictUnattributable,
+		},
 	}
 
 	for _, tt := range tests {
@@ -243,26 +274,31 @@ func TestRedactBody(t *testing.T) {
 }
 
 func TestMaskID(t *testing.T) {
-	if got := MaskID("24270001"); got != "2427****" {
-		t.Fatalf("MaskID = %q", got)
+	// 只留前 2 位与最后 1 位。
+	if got := MaskID("24000000"); got != "24*****0" {
+		t.Fatalf("MaskID = %q, want 24*****0", got)
+	}
+	if got := MaskID("24270001"); got != "24*****1" {
+		t.Fatalf("MaskID = %q, want 24*****1", got)
 	}
 	if got := MaskID("ab"); got != "ab" {
 		t.Fatalf("短 id 不应被打码: %q", got)
 	}
 }
 
-// 测试数据一律用虚构姓名：真名不进仓库。
+// MaskName 一位真实姓名的字都不留：姓名对上一份班级名单就能定位人。
+// 测试数据一律用虚构姓名，真名不进仓库。
 func TestMaskName(t *testing.T) {
 	tests := []struct {
 		in, want string
 	}{
-		{"张三丰", "张**"},
-		{"欧阳修文", "欧**"}, // 复姓也只留第一个字
-		{"张三", "张**"},
-		{"李", "李**"}, // 单字名同样不露出长度
-		{"Li Hua", "L**"},
-		{"  张三丰  ", "张**"},
-		{"", ""},
+		{"张三丰", "张三"},
+		{"欧阳修文", "张三"}, // 复姓也不再露出来
+		{"张三", "张三"},
+		{"李", "张三"}, // 单字名不再露出长度
+		{"Li Hua", "张三"},
+		{"  张三丰  ", "张三"},
+		{"", ""}, // 空串原样返回：区分「没姓名」与「已打码」
 	}
 	for _, tc := range tests {
 		if got := MaskName(tc.in); got != tc.want {
@@ -298,5 +334,32 @@ func TestSnapshotFallbackToContentHash(t *testing.T) {
 
 	if len(after.NewKeys(before)) != 1 {
 		t.Fatalf("无 id 字段时应退化为内容哈希: %v", after.NewKeys(before))
+	}
+}
+
+// URLTooLongHint 的边界取自 `har#3` 抓包（**完整 URL** 字节数）：5623（第 1 条，
+// 拿到业务 401）被接受，27847（第 10 条）被网关判 414。
+// 注意这个常量只是「已实测的最长接受值」，不是服务端上限。
+func TestURLTooLongHint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		urlLen  int
+		wantHit bool
+	}{
+		{name: "已实测被接受的最长 URL", urlLen: LongestAcceptedURLLen, wantHit: false},
+		{name: "短 URL", urlLen: 4696, wantHit: false},
+		{name: "刚超过已实测最长值", urlLen: LongestAcceptedURLLen + 1, wantHit: true},
+		{name: "已实测被拒的 URL", urlLen: 27847, wantHit: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hint := URLTooLongHint(tt.urlLen)
+			if hit := hint != ""; hit != tt.wantHit {
+				t.Fatalf("URLTooLongHint(%d) = %q, wantHit = %v", tt.urlLen, hint, tt.wantHit)
+			}
+		})
 	}
 }

@@ -7,6 +7,21 @@ import (
 	"time"
 )
 
+// Attempt 是同一档探针的一次往返。
+//
+// 大多数档只有一次；真值档会「换一个新的 captchaVerifyParam」重试（见 runner.go
+// 的 retryWithFreshParamReason），因此可能有多次。逐次记下来是为了把 `har#3`
+// 抓包里那条因果链留痕：请求行越长（`data` 膨胀）→ 越可能被网关判 `414`。
+type Attempt struct {
+	Status int `json:"status"`
+	// URLLen 是未脱敏的完整请求 URL 长度（字节），即请求行的主要部分。
+	URLLen int    `json:"urlLen"`
+	Body   string `json:"body,omitempty"`
+	// Retry 非空表示本次往返的失败属于「值得换一个新 captchaVerifyParam 重来」
+	// 那一类（是否真的重来，由 Attempts 长度与重取预算决定）。
+	Retry string `json:"retryReason,omitempty"`
+}
+
 // Entry 是一档探针的完整记录。
 type Entry struct {
 	Rung     RungID    `json:"rung"`
@@ -21,6 +36,12 @@ type Entry struct {
 	Status      int               `json:"status"`
 	RespHeaders map[string]string `json:"respHeaders,omitempty"`
 	Body        string            `json:"body,omitempty"`
+	// CaptchaVerifyCode 是成功响应里的 `captchaVerifyCode`（`T001` 成功 /
+	// `F001` 失败），`har#3` 抓包新发现的字段。
+	CaptchaVerifyCode string `json:"captchaVerifyCode,omitempty"`
+
+	// Attempts 是本档的全部往返；只有真值档可能多于一次。
+	Attempts []Attempt `json:"attempts,omitempty"`
 
 	Wrote     bool     `json:"wroteRecord"`
 	Before    int      `json:"readBackBefore"`
@@ -160,6 +181,33 @@ func (r *Report) Markdown() string {
 		fmt.Fprintf(&b, "- 请求：`%s %s`\n", e.Method, e.URL)
 		fmt.Fprintf(&b, "- 凭证形态：`%s`\n", e.ParamKind)
 		fmt.Fprintf(&b, "- 判读：`%s`（%s）\n", e.Verdict, e.Evidence)
+		if e.CaptchaVerifyCode != "" {
+			fmt.Fprintf(&b, "- `captchaVerifyCode`：`%s`（`T001` 成功 / `F001` 失败）\n", e.CaptchaVerifyCode)
+		}
+		if len(e.Attempts) > 1 {
+			b.WriteString("- 往返明细（换新 `captchaVerifyParam` 重取）：\n\n")
+			b.WriteString("  | # | HTTP | URL 长度 | 失败原因 |\n  | --- | --- | --- | --- |\n")
+			for i, a := range e.Attempts {
+				status := "-"
+				if a.Status != 0 {
+					status = fmt.Sprintf("%d", a.Status)
+				}
+				reason := "—"
+				if a.Retry != "" {
+					reason = a.Retry
+				}
+				fmt.Fprintf(&b, "  | %d | %s | %d | %s |\n", i+1, status, a.URLLen, reason)
+			}
+			b.WriteString("\n")
+			// 被重试盖掉的那几次响应也要留档：例如「有效签到码 + 人机判 false」
+			// 的 `F001` 只出现在第一次往返里。
+			for i, a := range e.Attempts {
+				if a.Body == "" || a.Body == e.Body {
+					continue
+				}
+				fmt.Fprintf(&b, "  第 %d 次响应：\n\n```json\n%s\n```\n\n", i+1, RedactBody(a.Body))
+			}
+		}
 		if e.Note != "" {
 			fmt.Fprintf(&b, "- 备注：%s\n", e.Note)
 		}

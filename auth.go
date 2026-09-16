@@ -12,7 +12,7 @@ import (
 
 // Login 执行完整的 CAS/SSO 登录并取得 session token。
 //
-// # 实测流程（2026-09-14 抓包 + 真机验证）
+// # 实测流程（`har#1`/`har#2` + 真机验证）
 //
 //  1. `GET /api/userinfo?type=&index=<index>`（不带 token）
 //     → `401`，响应体 `{"url":"https://cas.hdu.edu.cn/cas/login?state=...&service=..."}`。
