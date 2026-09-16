@@ -192,8 +192,13 @@
 //   - Client：会话、登录、重登、nonce 与错误翻译。可并发使用。
 //   - Request / Response：一次调用的输入输出；Do 是通用逃生口。
 //   - CaptchaProvider：签到所需人机验证参数的注入点。
+//   - SSOAuthenticator：SSO 登录的注入点；默认实现是 hduwebvpn/pkg/sso.Auth。
 //   - APIError：把 skl 的 `{"code":0,"msg":".."}` 业务错误、以及
 //     401 的双重语义（会话失效 vs 业务校验失败）翻译成结构化错误。
+//
+// 其余几条签到路径（包括「缺失 captchaVerifyParam」那一档）在子包
+// github.com/hdufuck/skl/pkg/signin 里，以可枚举的 Method 暴露；
+// 该子包消费调用方传入的 *Client，不拥有会话，也不做判读。
 //
 // # 风险与未解项
 //
@@ -299,11 +304,15 @@
 // 隔夜后仍可用（> 1 天）。本包因此在收到「带 url 的 401」时
 // 才重新登录，并用 WithOnToken 让调用方持久化，避免频繁登录。
 //
-// ## 8. 登录依赖 SSO 表单结构
+// ## 8. 登录默认依赖 SSO 表单结构（可注入替换）
 //
-// 登录链共用 hduwebvpn/pkg/sso：它依赖 sso.hdu.edu.cn 登录页的
+// 登录链的**默认**实现是 hduwebvpn/pkg/sso：它依赖 sso.hdu.edu.cn 登录页的
 // `#login-page-flowkey` / `#login-croypto` 两个元素以及 AES-ECB 密码加密。
-// 学校一旦改版，需要先升级 hduwebvpn。这是本包唯一的外部鉴权依赖。
+// 学校一旦改版，需要先升级 hduwebvpn。
+//
+// 但它不再是唯一选择：WithSSOAuthenticator 可以注入任何签名与
+// hduwebvpn/pkg/sso.Auth 对齐的实现（默认值就是它），因此调用方可以
+// 自行适配改版后的 SSO，而不必等上游升级。签名对齐使适配器只需要一行。
 //
 // ## 9. 钉钉 JSAPI 无法在钉钉之外使用
 //

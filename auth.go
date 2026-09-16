@@ -10,6 +10,38 @@ import (
 	"github.com/U1traVeno/hduwebvpn/pkg/sso"
 )
 
+// SSOAuthenticator 执行一次 SSO 登录并返回服务端下发的 ticket。
+//
+// 它的签名与 github.com/U1traVeno/hduwebvpn/pkg/sso.Auth 完全一致，
+// 因此可以用一行适配器把后者接上（默认实现就是它）：
+//
+//	skl.WithSSOAuthenticator(skl.SSOAuthenticatorFunc(sso.Auth))
+//
+// 注入点存在的理由：学校改版 SSO，或调用方要走别的认证通道时，
+// 不必等 hduwebvpn 上游升级。
+//
+// 注意 SSO 认证的用户与签到的用户是同一个人：会话获取只是签到的前置支撑，
+// 而不是一条独立的业务能力。
+type SSOAuthenticator interface {
+	// Authenticate 用 username/password 在 loginURL 完成登录并返回 ticket。
+	//
+	// client 由 skl 提供（已带 trace 层与 cookie jar）；实现应当在它之上
+	// 跟随重定向，因为会话 token 只出现在登录链末尾 URL 的 fragment 里。
+	Authenticate(ctx context.Context, client *http.Client, loginURL, username, password string) (ticket string, err error)
+}
+
+// SSOAuthenticatorFunc 把函数适配成 SSOAuthenticator。
+type SSOAuthenticatorFunc func(ctx context.Context, client *http.Client, loginURL, username, password string) (string, error)
+
+// Authenticate 实现 SSOAuthenticator。
+func (f SSOAuthenticatorFunc) Authenticate(ctx context.Context, client *http.Client, loginURL, username, password string) (string, error) {
+	return f(ctx, client, loginURL, username, password)
+}
+
+// defaultSSOAuthenticator 是未注入时的 SSO 实现：hduwebvpn 是默认依赖，
+// 不是唯一依赖。
+var defaultSSOAuthenticator SSOAuthenticator = SSOAuthenticatorFunc(sso.Auth)
+
 // Login 执行完整的 CAS/SSO 登录并取得 session token。
 //
 // # 实测流程（`har#1`/`har#2` + 真机验证）
@@ -86,8 +118,8 @@ func (c *Client) loginLocked(ctx context.Context) error {
 		return err
 	}
 
-	// sso.Auth 内部直接用传入的 httpClient 跟随重定向，且不走 Do 的
-	// per-request 超时，所以这里必须自己给整条链设一个上限。
+	// SSO 实现（默认 sso.Auth）内部直接用传入的 httpClient 跟随重定向，
+	// 且不走 Do 的 per-request 超时，所以这里必须自己给整条链设一个上限。
 	loginCtx := ctx
 	if c.timeout > 0 {
 		var cancel context.CancelFunc
@@ -96,7 +128,7 @@ func (c *Client) loginLocked(ctx context.Context) error {
 	}
 
 	c.trace.start()
-	_, err = sso.Auth(loginCtx, c.http, ssoURL, c.username, c.password)
+	_, err = c.ssoAuth.Authenticate(loginCtx, c.http, ssoURL, c.username, c.password)
 	chain := c.trace.stop()
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrLoginFailed, err)

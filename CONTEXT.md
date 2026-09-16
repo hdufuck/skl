@@ -39,3 +39,15 @@ _Avoid_: token、sessionId、X-Auth-Token
 **请求票据 SklTicket**:
 每个请求一次性生成的 21 字符防重放头 `skl-ticket`；复用同一个值会得到 `200` + 空 body。
 _Avoid_: ticket、nonce、skl-ticket
+
+**签到方式 Method**:
+`pkg/signin` 里一条可枚举的签到路径，ID 与探针阶梯的档位逐字对应（`analyze-a0` / `code-check-in` / `captcha-verify-missing` / `captcha-verify-forged` / `captcha-verify-genuine`）。
+_Avoid_: rung、阶梯档位（那是探针内部的说法）
+
+**签到结果 Outcome**:
+`pkg/signin` 对一次签到调用的统一返回：状态码、原始响应，以及解好的 `SignInResult` 或 `AnalyzeResult`。**不含判读**——「是否强制人机」不在里面。
+_Avoid_: Verdict、判定结果
+
+**SSO 鉴权器 SSOAuthenticator**:
+根包里可注入的 SSO 登录实现，默认是 `hduwebvpn/pkg/sso.Auth`；学校改版或换认证通道时替换它而不改签到路径。
+_Avoid_: 登录器、auth provider

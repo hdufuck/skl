@@ -119,6 +119,7 @@ type Client struct {
 	timeout       time.Duration
 	autoLogin     bool
 	captcha       CaptchaProvider
+	ssoAuth       SSOAuthenticator
 	logger        *slog.Logger
 	onToken       func(string)
 
@@ -144,6 +145,7 @@ func NewClient(opts ...Option) (*Client, error) {
 		timeout:   DefaultTimeout,
 		autoLogin: true,
 		logger:    slog.New(slog.DiscardHandler),
+		ssoAuth:   defaultSSOAuthenticator,
 	}
 	for _, opt := range opts {
 		if opt != nil {
