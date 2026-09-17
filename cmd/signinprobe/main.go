@@ -43,12 +43,12 @@ type options struct {
 	code   string
 	sample string
 
-	headed     bool
-	profile    string
-	noBrowser  bool
-	hookAddr   string
-	outDir     string
-	keepWrites bool
+	headed      bool
+	profile     string
+	noBrowser   bool
+	hookAddr    string
+	outDir      string
+	stopOnWrite bool
 
 	ladderDeadline  time.Duration
 	captchaDeadline time.Duration
@@ -74,7 +74,8 @@ func run() error {
 	fs.BoolVar(&opt.noBrowser, "no-browser", false, "跳过浏览器真值档（只跑档 1–4）")
 	fs.StringVar(&opt.hookAddr, "hook", ":8080", "Reqable 上报服务器监听地址；空串关闭")
 	fs.StringVar(&opt.outDir, "out", "probe-results", "报告输出目录")
-	fs.BoolVar(&opt.keepWrites, "continue-after-write", false, "检测到写入后不再询问、继续跑完（默认停）")
+	fs.BoolVar(&opt.stopOnWrite, "stop-after-write", false,
+		"检测到写入后按「首个写入即停」纪律终止后续档位（默认自动跑完全部档位）")
 
 	fs.DurationVar(&opt.ladderDeadline, "ladder-deadline", 8*time.Second, "档 1–4 的墙钟预算")
 	fs.DurationVar(&opt.captchaDeadline, "captcha-deadline", 23*time.Second, "真值档的墙钟预算")
@@ -242,7 +243,7 @@ func run() error {
 		GateTimeout:        opt.gateTimeout,
 		HookWait:           opt.hookWait,
 		GenuineAttempts:    opt.genuineAttempts,
-		ContinueAfterWrite: opt.keepWrites,
+		ContinueAfterWrite: !opt.stopOnWrite,
 	})
 	if err != nil {
 		return err
