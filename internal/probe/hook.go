@@ -135,7 +135,6 @@ func ParseHARExchange(body []byte) (*Entry, error) {
 		Title:     "手机端官方签到（Reqable 上报）",
 		Method:    chosen.Request.Method,
 		URL:       RedactURL(chosen.resolvedURL()),
-		ParamKind: ParamGenuine,
 		Status:    chosen.Response.Status,
 		Body:      strings.TrimSpace(respBody),
 		FromPhone: true,

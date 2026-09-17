@@ -8,11 +8,11 @@ import (
 	"time"
 )
 
-// Attempt 是同一档探针的一次往返。
+// Attempt 是真值档的一次往返。
 //
-// 大多数档只有一次；真值档会「换一个新的 captchaVerifyParam」重试（见 runner.go
-// 的 retryWithFreshParamReason），因此可能有多次。逐次记下来是为了把 `har#3`
-// 抓包里那条因果链留痕：请求行越长（`data` 膨胀）→ 越可能被网关判 `414`。
+// 换 skl-ticket 重发记在同一次往返里（见 runner.go 的 exchange）；只有「换一个新的
+// captchaVerifyParam」重试才会产生多条，因此逐次记下来能把 `har#3` 抓包里那条因果链
+// 留痕：请求行越长（`data` 膨胀）→ 越可能被网关判 `414`。
 type Attempt struct {
 	Status int `json:"status"`
 	// URLLen 是未脱敏的完整请求 URL 长度（字节），即请求行的主要部分。
@@ -23,18 +23,17 @@ type Attempt struct {
 	Retry string `json:"retryReason,omitempty"`
 }
 
-// Entry 是一档探针的完整记录。
+// Entry 是一次探针的完整记录。
 //
-// 它只记录事实，不记录判读：该档的请求/响应，以及该档请求之后读到的考勤记录。
+// 它只记录事实，不记录判读：请求/响应，以及该请求之后读到的考勤记录。
 type Entry struct {
 	Rung     RungID    `json:"rung"`
 	Title    string    `json:"title"`
 	At       time.Time `json:"at"`
 	Duration string    `json:"duration"`
 
-	Method    string    `json:"method,omitempty"`
-	URL       string    `json:"url,omitempty"`
-	ParamKind ParamKind `json:"paramKind"`
+	Method string `json:"method,omitempty"`
+	URL    string `json:"url,omitempty"`
 
 	Status      int               `json:"status"`
 	RespHeaders map[string]string `json:"respHeaders,omitempty"`
@@ -43,7 +42,7 @@ type Entry struct {
 	// 只作留档；成败由人看响应体判断。
 	CaptchaVerifyCode string `json:"captchaVerifyCode,omitempty"`
 
-	// Attempts 是本档的全部往返；只有真值档可能多于一次。
+	// Attempts 是本档的全部往返；只有换新参数重取时才会多于一条。
 	Attempts []Attempt `json:"attempts,omitempty"`
 
 	// AfterRequest 是本档请求之后读到的今日考勤记录（`/api/check-in-student-detail/my`
@@ -82,7 +81,7 @@ type Report struct {
 // GenuineUnproven 报告真值档是否连请求都没发出去。
 //
 // 判据就是「没有拿到任何 HTTP 状态」：它说明浏览器取参链路没走通
-// （浏览器/上下文被提前关掉、SDK 没出参、点击落空等），此时第 4 档对
+// （浏览器/上下文被提前关掉、SDK 没出参、点击落空等），此时本次运行对
 // 「库的 SignIn 封装路径能否走通」没给出任何证据。
 func (r *Report) GenuineUnproven() bool {
 	for _, e := range r.Entries {
@@ -136,8 +135,8 @@ func (r *Report) Markdown() string {
 	fmt.Fprintf(&b, "- 定位：`%.6f, %.6f`\n", r.Lat, r.Lon)
 	fmt.Fprintf(&b, "- T0 前考勤记录基线：%d 条\n\n", r.BaselineCount)
 
-	b.WriteString("| 档位 | 凭证 | HTTP | 请求后考勤记录 |\n")
-	b.WriteString("| --- | --- | --- | --- |\n")
+	b.WriteString("| 档位 | HTTP | 请求后考勤记录 |\n")
+	b.WriteString("| --- | --- | --- |\n")
 	for _, e := range r.Entries {
 		status := "-"
 		if e.Status != 0 {
@@ -147,7 +146,7 @@ func (r *Report) Markdown() string {
 		if e.AfterRequest != nil {
 			records = fmt.Sprintf("%d 条", len(e.AfterRequest))
 		}
-		fmt.Fprintf(&b, "| `%s` | %s | %s | %s |\n", e.Rung, e.ParamKind, status, records)
+		fmt.Fprintf(&b, "| `%s` | %s | %s |\n", e.Rung, status, records)
 	}
 	b.WriteString("\n")
 
@@ -166,7 +165,6 @@ func (r *Report) Markdown() string {
 	for _, e := range r.Entries {
 		fmt.Fprintf(&b, "## `%s`\n\n", e.Rung)
 		fmt.Fprintf(&b, "- 请求：`%s %s`\n", e.Method, e.URL)
-		fmt.Fprintf(&b, "- 凭证形态：`%s`\n", e.ParamKind)
 		if e.CaptchaVerifyCode != "" {
 			fmt.Fprintf(&b, "- `captchaVerifyCode`：`%s`（`T001` 成功 / `F001` 失败）\n", e.CaptchaVerifyCode)
 		}

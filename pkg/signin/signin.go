@@ -87,7 +87,7 @@ type Request struct {
 // Outcome 是一次签到调用的统一结果。
 //
 // 它**只装事实、不做判读**：是否「未携带真凭证却写入了记录」、是否
-// 「指向人机层/参数层」这类归因由调用方决定。SignIn 与 Analyze 互斥，
+// 「被风控拒/被参数层拒」这类归因由调用方决定。SignIn 与 Analyze 互斥，
 // 取决于调用的路径。
 type Outcome struct {
 	// StatusCode 是 HTTP 状态码；传输层失败且读不到响应时为 0。

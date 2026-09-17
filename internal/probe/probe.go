@@ -1,7 +1,24 @@
-// Package probe 实现「一次性签到探针」的纯逻辑部分：阶梯定义、请求之后的
+// Package probe 实现「一次性签到探针」的纯逻辑部分：档位定义、请求之后的
 // 考勤记录读回、脱敏与报告渲染。
 //
-// 它**不做判读**：只把每档的请求/响应，以及该档之后读到的考勤记录原样记下来，
+// 一次窗口只做一件事：验证库的 `SignIn` 封装路径可用，并取回一条活路径成功样本。
+// 因此本机只有真值档一档（RungCaptchaGenuine）——由浏览器里的官方 SDK 产出
+// captchaVerifyParam，再交给库的 SignIn 送出去。
+//
+// 为什么不再探测「人机验证是否强制」：
+//
+//   - 活路径必带参数——现行前端只有 `captcha-verify` 一条活着的签到路径，而它只在
+//     阿里云 SDK 出参之后才提交；
+//   - 遗留端点 `code-check-in` 在前端构建里零调用者，两份 HAR 里也从未出现；
+//   - 本机缺参只能拿到单边结果——签到码校验先于人机校验，缺失/伪造/不传参数都会
+//     得到同一个 `401 签到码不存在`，一次失败无法区分「服务端真的不校验」与
+//     「校验了但错误不可判读」（依据见 docs/api.md §3.2）。
+//
+// 三条加起来，前置档给出的信息量低于它们带来的先验污染与窗口成本：在真值档之前
+// 对同一个 userid+scene 打几次失败的人机提交，会把 `F001` 的归属搅浑。
+// 决策见 ADR 0004。
+//
+// 它**不做判读**：只把请求/响应，以及请求之后读到的考勤记录原样记下来，
 // 由人去看。这里的代码不直接发起任何网络请求，也不启动浏览器；网络与浏览器行为由
 // 调用方（cmd/signinprobe）注入，因此全部可单测。
 package probe
@@ -10,135 +27,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"slices"
 	"strings"
-
-	"github.com/hdufuck/skl/pkg/signin"
 )
 
 // ToolVersion 是报告里记录的工具版本。
 const ToolVersion = "signinprobe/1"
 
-// RungID 标识阶梯上的一档探针。
+// RungID 标识一条证据来源。
 //
-// 顺序即开火顺序：从「不需要人机验证」到「需要人机验证」。
+// 不再是「从弱到强的阶梯」：本机只跑真值档，RungPhoneCaptcha 是手机端 Reqable
+// 上报回来的那次官方签到，两条来源互相独立。
 type RungID string
 
 const (
-	// RungLegacyCheckIn 是遗留端点 `code-check-in`，不传人机凭证，需要定位。
-	RungLegacyCheckIn RungID = "code-check-in"
-	// RungCaptchaMissing 是活路径 `captcha-verify`，**缺失** captchaVerifyParam。
-	RungCaptchaMissing RungID = "captcha-verify-missing"
-	// RungCaptchaForged 是活路径 `captcha-verify`，**伪造** captchaVerifyParam。
-	RungCaptchaForged RungID = "captcha-verify-forged"
 	// RungCaptchaGenuine 是活路径 `captcha-verify`，**真值** captchaVerifyParam
 	// （由浏览器里的官方 SDK 产出），走库的 SignIn 封装。
 	RungCaptchaGenuine RungID = "captcha-verify-genuine"
-	// RungPhoneCaptcha 不是本机阶梯的一档：它是手机端 Reqable 上报的那次官方签到。
+	// RungPhoneCaptcha 不是本机跑的档位：它是手机端 Reqable 上报的那次官方签到。
 	RungPhoneCaptcha RungID = "phone-captcha-verify"
-)
-
-// Ladder 是按开火顺序排列的全部档位。
-//
-// 不含 RungCaptchaGenuine 时即为「档 1–3」。
-var Ladder = []RungID{
-	RungLegacyCheckIn,
-	RungCaptchaMissing,
-	RungCaptchaForged,
-	RungCaptchaGenuine,
-}
-
-// ParseLadder 把命令行给出的阶梯规格解析成开火顺序。
-//
-// 接受的写法（大小写不敏感、首尾空格忽略）：
-//
-//	"" / "all"          → (nil, nil)：不覆盖，Run 回落到包级 Ladder 的默认顺序
-//	"genuine"            → 只跑真值档
-//	"junk"（别名 "pre"） → 三档非真值档，默认顺序
-//	逗号分隔的档位 ID     → 严格按给定顺序，如 "captcha-verify-genuine,code-check-in"
-//
-// 为什么需要「只跑真值档 / 把真值档排最前」：前置三档会在真值档之前几秒，
-// 对同一个 userid+scene 打出失败的（缺失/伪造）人机提交——这是真值档 F001
-// 判读的混淆项。真实窗口昂贵且一次性，操作者必须能排除这个先验污染，
-// 单独跑一次真值档来回答「库的 SignIn 路径能否走通」。
-//
-// 未识别的档位 ID、空的列表元素都返回错误，并在错误里列出合法档位。
-func ParseLadder(spec string) ([]RungID, error) {
-	s := strings.TrimSpace(spec)
-	switch strings.ToLower(s) {
-	case "", "all":
-		// 刻意返回 nil 而不是 Ladder 的副本：nil 表示「未覆盖」，
-		// 保证 Config.Ladder 与 Ladder 之间的默认语义只有一处。
-		return nil, nil
-	case "genuine":
-		return []RungID{RungCaptchaGenuine}, nil
-	case "junk", "pre":
-		return []RungID{RungLegacyCheckIn, RungCaptchaMissing, RungCaptchaForged}, nil
-	}
-
-	parts := strings.Split(s, ",")
-	out := make([]RungID, 0, len(parts))
-	for _, part := range parts {
-		id := RungID(strings.ToLower(strings.TrimSpace(part)))
-		if id == "" {
-			return nil, fmt.Errorf("probe: 阶梯规格 %q 里有空的档位 ID；合法档位：%s，或 all / genuine / junk",
-				spec, strings.Join(ladderIDs(), ", "))
-		}
-		if !slices.Contains(Ladder, id) {
-			return nil, fmt.Errorf("probe: 未知档位 %q；合法档位：%s，或 all / genuine / junk",
-				id, strings.Join(ladderIDs(), ", "))
-		}
-		out = append(out, id)
-	}
-	return out, nil
-}
-
-// ladderIDs 返回 Ladder 上各档的 ID 字符串，用于错误提示。
-func ladderIDs() []string {
-	ids := make([]string, len(Ladder))
-	for i, r := range Ladder {
-		ids[i] = string(r)
-	}
-	return ids
-}
-
-// ParamKind 描述该档携带的人机凭证形态。
-type ParamKind string
-
-const (
-	// ParamNone 表示请求里根本没有 captchaVerifyParam。
-	ParamNone ParamKind = "none"
-	// ParamForged 表示结构合法但内容伪造。
-	ParamForged ParamKind = "forged"
-	// ParamGenuine 表示由官方 SDK 产出的真值。
-	ParamGenuine ParamKind = "genuine"
 )
 
 // Title 返回档位的中文标题。
 func (r RungID) Title() string {
 	switch r {
-	case RungLegacyCheckIn:
-		return "遗留 code-check-in（无人机凭证，带定位）"
-	case RungCaptchaMissing:
-		return "活路径 captcha-verify（缺失 captchaVerifyParam）"
-	case RungCaptchaForged:
-		return "活路径 captcha-verify（伪造 captchaVerifyParam）"
 	case RungCaptchaGenuine:
 		return "活路径 captcha-verify（官方 SDK 真值 → 库 SignIn）"
+	case RungPhoneCaptcha:
+		return "手机端官方签到（Reqable 上报）"
 	default:
 		return string(r)
-	}
-}
-
-// ParamKind 返回该档携带的凭证形态。
-func (r RungID) ParamKind() ParamKind {
-	switch r {
-	case RungCaptchaForged:
-		return ParamForged
-	case RungCaptchaGenuine:
-		return ParamGenuine
-	default:
-		return ParamNone
 	}
 }
 
@@ -163,14 +80,6 @@ func URLTooLongHint(urlLen int) string {
 	}
 	return fmt.Sprintf("URL 长 %d 字节，超过已实测的接受值（%d）⟹ 大概率被网关判 414（`har#3` 抓包）",
 		urlLen, LongestAcceptedURLLen)
-}
-
-// ForgeParam 构造一个「结构合法但内容伪造」的 captchaVerifyParam。
-//
-// sample 是一份真实的 captchaVerifyParam（可为空）。实现委托给
-// signin.ForgeCaptchaParam，保证探针与库只有一份伪造实现、不会漂移。
-func ForgeParam(sample string) string {
-	return signin.ForgeCaptchaParam(sample)
 }
 
 // RedactCaptchaParam 按文档的脱敏规则处理 captchaVerifyParam：

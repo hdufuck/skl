@@ -44,18 +44,14 @@ type Config struct {
 	UserID string
 	Coord  Coord
 
-	// Sample 是一份真实 captchaVerifyParam（可为空），用于让伪造值等长。
-	Sample string
-
-	// Captcha 是真值来源；为 nil 或 SkipGenuine 时跳过第 5 档。
-	Captcha     CaptchaParamSource
-	SkipGenuine bool
+	// Captcha 是真值来源。整个工具的目的就是它，为 nil 时 Run 直接报错。
+	Captcha CaptchaParamSource
 
 	Prompter Prompter
 	// Now 覆盖时间源（测试用）；为 nil 时用 time.Now。
 	Now func() time.Time
 
-	// ReadBack 读取**当前（今日）的考勤记录原始数组**。每档请求之后调用一次，
+	// ReadBack 读取**当前（今日）的考勤记录原始数组**。请求之后调用一次，
 	// 结果原样记进报告，不做任何判读。为 nil 时报错。
 	ReadBack func(ctx context.Context) ([]json.RawMessage, error)
 	// Baseline 是 T0 前的考勤记录基线；为 nil 时在 Run 开始时现读一次。
@@ -64,16 +60,7 @@ type Config struct {
 	// Hook 是手机端 Reqable 上报服务器送来的条目（可为 nil）。
 	Hook <-chan Entry
 
-	// Ladder 覆盖本次运行的开火顺序（可选）；为空表示用包级默认 Ladder。
-	//
-	// 为什么允许覆盖：前置三档会在真值档之前几秒，对同一个 userid+scene
-	// 打出失败的人机提交，这是真值档 F001 归属的混淆项；而真实窗口昂贵且
-	// 一次性，所以操作者必须能把真值档单独（或排在最前）跑一次。
-	// 用 ParseLadder 从命令行规格构造。
-	Ladder []RungID
-
 	// 以下均为可选覆盖，0 表示用默认值。
-	LadderDeadline  time.Duration
 	CaptchaDeadline time.Duration
 	HookWait        time.Duration
 
@@ -83,20 +70,12 @@ type Config struct {
 }
 
 const (
-	defaultLadderDeadline  = 8 * time.Second
 	defaultCaptchaDeadline = 23 * time.Second
 	defaultHookWait        = 10 * time.Second
 	// defaultGenuineAttempts 默认让真值档最多跑 3 次：`har#3` 抓包里
 	// 第 1、2 次都死在网关（414），第 3 次才真正到应用并成功。
 	defaultGenuineAttempts = 3
 )
-
-func (c Config) ladderDeadline() time.Duration {
-	if c.LadderDeadline > 0 {
-		return c.LadderDeadline
-	}
-	return defaultLadderDeadline
-}
 
 func (c Config) captchaDeadline() time.Duration {
 	if c.CaptchaDeadline > 0 {
@@ -112,27 +91,17 @@ func (c Config) hookWait() time.Duration {
 	return defaultHookWait
 }
 
-// rungAttempts 返回该档允许的往返次数（含最后一次）。
+// attempts 返回真值档允许的往返次数（含最后一次）。
 //
-// 只有真值档会「换一个新 captchaVerifyParam 重来」：`har#3` 抓包里三次提交
+// 只有「换一个新 captchaVerifyParam 重来」这一种重试：`har#3` 抓包里三次提交
 // 才成功一次，前两次分别是 TRACELESS 的 data 膨胀到 25 KB 被网关判 `414`、
 // 以及人机判定 `false`（`F001`）；两种情况换新参数都大概率能过——官方 SDK
 // 自己也是这么做的（`F001` 后自动 `reInitCaptcha`，重取参数后一次成功）。
-func (c Config) rungAttempts(rung RungID) int {
-	if rung != RungCaptchaGenuine {
-		return 1
-	}
+func (c Config) attempts() int {
 	if c.GenuineAttempts > 0 {
 		return c.GenuineAttempts
 	}
 	return defaultGenuineAttempts
-}
-
-func (c Config) ladder() []RungID {
-	if len(c.Ladder) == 0 {
-		return Ladder
-	}
-	return c.Ladder
 }
 
 func (c Config) now() time.Time {
@@ -142,9 +111,9 @@ func (c Config) now() time.Time {
 	return time.Now()
 }
 
-// Run 按阶梯顺序执行探针，返回完整报告。
+// Run 执行探针（真值档），在这之后读回考勤记录、等待手机 HAR 上报，返回完整报告。
 //
-// T0 是 Run 被调用的时刻（即签到码已拿到）；所有 deadline 都相对 T0 计算，
+// T0 是 Run 被调用的时刻（即签到码已拿到）；deadline 相对 T0 计算，
 // 保证即使真实窗口只有 30 秒也能在预算内收尾。
 func Run(ctx context.Context, cfg Config) (*Report, error) {
 	if cfg.Client == nil {
@@ -155,6 +124,10 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 	}
 	if cfg.ReadBack == nil {
 		return nil, errors.New("probe: 未提供 ReadBack")
+	}
+	// 整个工具的目的就是验证库的 SignIn 封装路径，没有真值来源就等于什么都验证不了。
+	if cfg.Captcha == nil {
+		return nil, errors.New("probe: 未提供真值来源（Config.Captcha）；一次运行必须带上浏览器取参链路")
 	}
 
 	start := cfg.now()
@@ -178,31 +151,14 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 	}
 	rep.BaselineCount = len(baseline)
 
-	ladderDeadline := start.Add(cfg.ladderDeadline())
 	captchaDeadline := start.Add(cfg.captchaDeadline())
 
-	for _, rung := range cfg.ladder() {
-		budget := cfg.ladderDeadline()
-		deadline := ladderDeadline
-		if rung == RungCaptchaGenuine {
-			if cfg.Captcha == nil || cfg.SkipGenuine {
-				continue
-			}
-			budget = cfg.captchaDeadline()
-			deadline = captchaDeadline
-		}
-		if cfg.now().After(deadline) {
-			rep.Notes = append(rep.Notes, fmt.Sprintf("跳过 %s：超出 %.0fs 预算", rung, budget.Seconds()))
-			continue
-		}
-
-		// 给每档一个真实的 ctx deadline，而不是只在起跑前比较时间：
-		// 否则一个挂起的请求会直接击穿预算，吃掉留给手机的窗口。
-		rungCtx, cancelRung := context.WithDeadline(ctx, deadline)
-		entry := cfg.runRung(rungCtx, rung)
-		cancelRung()
-		rep.Entries = append(rep.Entries, entry)
-	}
+	// 只跑真值档。给它的 ctx 一个真实的 deadline，而不是只在起跑前比较时间：
+	// 否则一个挂起的请求会直接击穿预算，吃掉留给手机的窗口。
+	rungCtx, cancelRung := context.WithDeadline(ctx, captchaDeadline)
+	entry := cfg.runRung(rungCtx, RungCaptchaGenuine)
+	cancelRung()
+	rep.Entries = append(rep.Entries, entry)
 
 	if cfg.Hook != nil {
 		if cfg.Prompter != nil {
@@ -246,18 +202,17 @@ func phoneCodeNote(phone *Entry, want string) string {
 	return fmt.Sprintf("手机端上报的签到码是 %s，与本次的 %s 不同 ⟹ 那不是同一个窗口，不能当对照（请在手机签到页重新输入本次的码）", got, want)
 }
 
-// runRung 执行一档探针并组装记录。
+// runRung 执行真值档探针并组装记录。
 func (cfg Config) runRung(ctx context.Context, rung RungID) Entry {
 	entry := Entry{
-		Rung:      rung,
-		Title:     rung.Title(),
-		At:        cfg.now(),
-		ParamKind: rung.ParamKind(),
+		Rung:  rung,
+		Title: rung.Title(),
+		At:    cfg.now(),
 	}
 
 	began := cfg.now()
 
-	max := cfg.rungAttempts(rung)
+	max := cfg.attempts()
 	var (
 		ex     *Exchange
 		runErr error
@@ -282,7 +237,7 @@ func (cfg Config) runRung(ctx context.Context, rung RungID) Entry {
 		}
 		curHints := hintsFrom(body)
 
-		retry := retryWithFreshParamReason(rung, cur, curHints)
+		retry := retryWithFreshParamReason(cur, curHints)
 		entry.Attempts = append(entry.Attempts, newAttempt(cur, body, retry))
 
 		if cur != nil && cur.Err == nil && cur.Status != 0 {
@@ -356,10 +311,10 @@ func (cfg Config) exchange(ctx context.Context, rung RungID, note *string) (*Exc
 
 // retryWithFreshParamReason 报告是否值得换一个新的 captchaVerifyParam 重来。
 //
-// 只有真值档才重取：重取要重走一遍浏览器取参，有成本；而其余档的参数本来就
-// 是伪造/缺失的，重取没有意义。
-func retryWithFreshParamReason(rung RungID, ex *Exchange, hints hintSet) string {
-	if rung != RungCaptchaGenuine || ex == nil || ex.Err != nil {
+// 重取要重走一遍浏览器取参，有成本，所以只在「失败能归因到请求行/参数」时才重取；
+// 签到码不存在这类明确的响应不在此列。
+func retryWithFreshParamReason(ex *Exchange, hints hintSet) string {
+	if ex == nil || ex.Err != nil {
 		return ""
 	}
 	switch {
@@ -397,51 +352,10 @@ func isRetryableEmptyBody(ex *Exchange) bool {
 	return ex != nil && ex.Status == http.StatusOK && len(bytes.TrimSpace(ex.Body)) == 0
 }
 
-// execute 调用库的封装路径执行一档探针。
+// execute 调用库的封装路径执行探针。
 func (cfg Config) execute(ctx context.Context, rung RungID) error {
 	switch rung {
-	case RungLegacyCheckIn:
-		_, err := cfg.Client.SignInLegacy(ctx, skl.SignInRequest{
-			Code:      cfg.Code,
-			UserID:    cfg.UserID,
-			Latitude:  cfg.Coord.Lat,
-			Longitude: cfg.Coord.Lon,
-		})
-		return err
-
-	case RungCaptchaMissing:
-		// 库的 SignIn 不允许空 captchaVerifyParam（会返回 ErrNoCaptchaProvider
-		// 且不发请求），因此这一档直接用 Do 发出「同形但缺参」的请求。
-		// 显式带上 Content-Type，保持与官方请求逐字节一致。
-		query := url.Values{
-			"userid":    {cfg.UserID},
-			"code":      {cfg.Code},
-			"latitude":  {formatCoord(cfg.Coord.Lat)},
-			"longitude": {formatCoord(cfg.Coord.Lon)},
-			"t":         {strconv.FormatInt(cfg.now().UnixMilli(), 10)},
-		}
-		_, err := cfg.Client.Do(ctx, &skl.Request{
-			Method: http.MethodPost,
-			Path:   skl.PathSignInCaptchaVerify,
-			Query:  query,
-			Header: http.Header{"Content-Type": {"application/x-www-form-urlencoded"}},
-		})
-		return err
-
-	case RungCaptchaForged:
-		_, err := cfg.Client.SignIn(ctx, skl.SignInRequest{
-			Code:               cfg.Code,
-			UserID:             cfg.UserID,
-			Latitude:           cfg.Coord.Lat,
-			Longitude:          cfg.Coord.Lon,
-			CaptchaVerifyParam: ForgeParam(cfg.Sample),
-		})
-		return err
-
 	case RungCaptchaGenuine:
-		if cfg.Captcha == nil {
-			return errors.New("probe: 未配置真值来源")
-		}
 		param, err := cfg.Captcha.Param(ctx)
 		if err != nil {
 			return fmt.Errorf("probe: 获取真值 captchaVerifyParam: %w", err)

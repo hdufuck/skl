@@ -195,10 +195,11 @@ for _, m := range signin.Methods() {
 | `Genuine` | `captcha-verify` | `req.CaptchaVerifyParam` 或 `CaptchaProvider` | 传 |
 
 `Outcome` **不带判读结论**：它只装状态码、原始 `*skl.Response` 与解好的
-`*skl.SignInResult` / `*skl.AnalyzeResult`。「是否强制人机」的归因留在
-`internal/probe` 与调用方。库也不做路径间自动降级、不自动重试 `200 + 空 body`
-（`skl-ticket` 是一次性的）。`signin.Methods()` 的 ID 与探针阶梯逐字对应，
-便于把结果写进日志或报告；`signin.Find(id)` 按 ID 取回单条方式。
+`*skl.SignInResult` / `*skl.AnalyzeResult`。归因（比如「被风控拒」）留在调用方。
+库也不做路径间自动降级、不自动重试 `200 + 空 body`（`skl-ticket` 是一次性的）。
+`signin.Methods()` 列出全部五条路径，便于按 ID 写进日志或报告；`signin.Find(id)` 按 ID 取回
+单条方式。注意它们**不都是探针会跑的**：`cmd/signinprobe` 只跑 `captcha-verify-genuine`
+（见 [`docs/adr/0004`](docs/adr/0004-阶梯只保留真值档.md)），其余四条仅供调用方显式使用。
 
 > ⚠️ `WithoutParam` / `WithParam` / `Forged` / `ForgeCaptchaParam` 发出的都是
 > **真实签到请求**：一旦服务端不强制人机验证，它们可能写入真实 `CheckInRecord`。
@@ -261,8 +262,9 @@ for _, m := range signin.Methods() {
 `200 {"captchaVerifyResult":false,"captchaVerifyCode":"F001"}`（**不是** 401）——
 说明**风控**会在签到码之后单独拦一次请求（`F001` 的官方定义是「疑似攻击请求，
 风险策略不通过」，错误码表见 [`docs/signin-probe.md`](docs/signin-probe.md) §0.1）。
-但「有效码 + 完全不给参数」仍未被采样，
-所以「是否**强制**」依然只能靠探针在真实窗口里回答。
+但「有效码 + 完全不给参数」始终未被采样。本库因此**按「强制」前提运作、不再探测**
+这个题（缺参只能拿到不可解释的 `401`，而缺参档本身就是一次未鉴权的写入尝试）：
+决策与后果见 [`docs/adr/0004-阶梯只保留真值档.md`](docs/adr/0004-阶梯只保留真值档.md)。
 
 同理，遗留接口 `checkIn/code-check-in` 与 `ali-nvc/check-code-analyze`
 也**不能在拿到有效签到码前证伪**。但要注意：bundle 级检索显示它们**不是**「官方页面也会走的备用路」——
@@ -270,22 +272,23 @@ for _, m := range signin.Methods() {
 （且它传的 `code` 是定位就绪标志的布尔值，不是签到码）。所以用它们做探针只能得到**单边证据**：
 成功才算证明不强制，失败不可解释。
 
-**完整的判定方法与操作手册见 [`docs/signin-probe.md`](docs/signin-probe.md)**：
+**完整的判定方法与操作手册见 [`docs/signin-probe.md`](docs/signin-probe.md)**。
+探针只跑**真值档**一档：
 
 | 档 | 内容 |
 | --- | --- |
-| 1 | `code-check-in`（无人机凭证、带定位） |
-| 2 | 有效码 + **缺失** `captchaVerifyParam`（直接回答「是否强制」） |
-| 3 | 有效码 + **结构合法但伪造**的凭证（把参数层与人机层分开） |
-| 4 | 有效码 + **官方 SDK 真值** → 库的 `SignIn`（验证库的封装路径；失败自动换新参数最多 3 次） |
+| `captcha-verify-genuine` | 有效码 + **官方 SDK 真值** → 库的 `SignIn`（验证库的封装路径；失败自动换新参数最多 3 次） |
 
-预置清单、相位预算（默认 8s + 23s，可用 `--ladder-deadline` /
-`--captcha-deadline` 收紧到 20s 窗口以内）、每档请求后的考勤记录读回、脱敏规则、
-以及手机端（钉钉 + Reqable 上报服务器）要做的每一步，都在那份手册里。
-真窗口建议用 `--ladder genuine` 只跑真值档：前置三档会向同一个 `userid`+`scene`
-打进去几次风控不通过的提交，紧接在真值档之前，是「真值档为什么 F001」的混淆因子。
-这套实验的约束与取舍——为什么允许从本机发探针、为什么本机失败只作弱证据、
-为什么继续排除模拟器——见
+> 「人机验证是否强制」**不再探测**：活路径必带参数、遗留端点零调用者、缺参只有单边结果，
+> 而前置档会在真值档之前向同一个 `userid`+`scene` 打进去几次被风控拒的提交，把 `F001`
+> 的归属搅浑（且缺参档本身就是一次未鉴权的写入尝试）。现在按**强制**前提运作，
+> 决策与后果见
+> [`docs/adr/0004-阶梯只保留真值档.md`](docs/adr/0004-阶梯只保留真值档.md)。
+
+预置清单、相位预算（真值档 23s，可用 `--captcha-deadline` 收紧到 20s 窗口以内）、
+真值档请求之后的考勤记录读回、脱敏规则、以及手机端（钉钉 + Reqable 上报服务器）
+要做的每一步，都在那份手册里。这套实验的约束与取舍——为什么允许从本机发探针、
+为什么本机失败只作弱证据、为什么继续排除模拟器——见
 [`docs/adr/0002-本机探针与浏览器取参的取舍.md`](docs/adr/0002-本机探针与浏览器取参的取舍.md)；
 浏览器应该自称成什么设备（默认：一台自洽的桌面 Chrome，不冒充手机）见
 [`docs/adr/0003-浏览器自称与真实平台自洽.md`](docs/adr/0003-浏览器自称与真实平台自洽.md)。
@@ -441,16 +444,14 @@ CAS 回调与 token 下发，因此**整条登录链是可以离线测试的**�
 
 判定「人机验证是否强制」并验证库的签到封装路径是一次性的现场实验，
 **不在测试套件里**：按 [`docs/signin-probe.md`](docs/signin-probe.md) 执行——
-预置清单、30 秒相位预算、探针顺序、每档请求后的考勤记录读回、手机端操作与脱敏规则都写在那里，
+预置清单、相位预算、真值档之后的考勤记录读回、手机端操作与脱敏规则都写在那里，
 不要临场发挥。探针工具是 [`cmd/signinprobe`](cmd/signinprobe/main.go)：
 
 ```bash
 export HDU_USER=2427xxxx HDU_PASS=...
-go run ./cmd/signinprobe                          # 默认：headless=new + 桌面 Chrome 自称、全部四档
-# 真窗口推荐（只跑真值档，避免前置三档污染 F001 归因）：
-#   go run ./cmd/signinprobe --ladder genuine
-# 其它开关：--headed  --mobile  --ua '<UA>'  --client-ua browser  --no-browser
-#          --ladder all|genuine|junk|<档位ID列表>  --profile <目录>
+go run ./cmd/signinprobe                          # 默认：headless=new + 桌面 Chrome 自称
+# 其它开关：--headed  --mobile  --ua '<UA>'  --client-ua browser
+#          --profile <目录>  --captcha-deadline 12s  --genuine-attempts 2
 ```
 
 > ⚠️ **不要把真实数据写进代码或文档。** 本文库会公开，而抓包/真机调试很容易

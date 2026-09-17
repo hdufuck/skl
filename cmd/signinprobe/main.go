@@ -1,5 +1,8 @@
-// Command signinprobe 是一次性签到探针：在真实有效的签到码窗口内，按
-// 「不需要人机验证 → 需要人机验证」的顺序各打一档，尽可能一次拿全结论。
+// Command signinprobe 是一次性签到探针：在真实有效的签到码窗口内，用浏览器里的
+// 官方 SDK 现场取一个真值 captchaVerifyParam，交给库的 SignIn 封装路径发出去，
+// 一次拿到「库的封装路径可用」＋一条活路径成功样本。
+//
+// 为什么只做这一件事（不再探测「人机是否强制」）：见 ADR 0004。
 //
 // 用法与操作步骤见 docs/signin-probe.md。**不要在窗口之前临时学习它**，
 // 所有预置（登录、读回预热、浏览器预热、Reqable 上报）都在 T0 之前完成。
@@ -14,10 +17,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
@@ -34,29 +35,24 @@ func main() {
 }
 
 type options struct {
-	user   string
-	pass   string
-	token  string
-	base   string
-	lat    float64
-	lon    float64
-	code   string
-	sample string
+	user  string
+	pass  string
+	token string
+	base  string
+	lat   float64
+	lon   float64
+	code  string
 
-	headed    bool
-	profile   string
-	noBrowser bool
-	hookAddr  string
-	outDir    string
+	headed   bool
+	profile  string
+	hookAddr string
+	outDir   string
 
 	// 浏览器自称。
 	mobile    bool
 	userAgent string
 	clientUA  string
-	// ladder 是本次要跑的档位（probe.ParseLadder 的输入）。
-	ladder string
 
-	ladderDeadline  time.Duration
 	captchaDeadline time.Duration
 	hookWait        time.Duration
 	genuineAttempts int
@@ -72,11 +68,9 @@ func run() error {
 	fs.Float64Var(&opt.lat, "lat", envFloat("SKL_LAT", 30.313816), "签到定位纬度")
 	fs.Float64Var(&opt.lon, "lon", envFloat("SKL_LON", 120.343228), "签到定位经度")
 	fs.StringVar(&opt.code, "code", "", "4 位签到码；留空则交互输入")
-	fs.StringVar(&opt.sample, "sample-file", "", "含真实 captchaVerifyParam 的 HAR/文本，用于让伪造值等长；留空则自动在 *.har 里找")
 
 	fs.BoolVar(&opt.headed, "headed", false, "用可见窗口跑 Chrome（默认 headless=new）")
 	fs.StringVar(&opt.profile, "profile", "", "Chrome 持久化 profile 目录")
-	fs.BoolVar(&opt.noBrowser, "no-browser", false, "跳过浏览器真值档（只跑前置三档）")
 	fs.StringVar(&opt.hookAddr, "hook", ":8080", "Reqable 上报服务器监听地址；空串关闭")
 	fs.StringVar(&opt.outDir, "out", "probe-results", "报告输出目录")
 
@@ -86,14 +80,11 @@ func run() error {
 		"浏览器自称的 UA；留空 = 桌面用真实 UA 去掉 headless 标记、手机用内置 Android 模板（可粘钉钉那串）")
 	fs.StringVar(&opt.clientUA, "client-ua", "",
 		"skl HTTP 客户端的 User-Agent：留空 = 项目自报名；browser = 与浏览器自称一致；其它 = 原样使用")
-	fs.StringVar(&opt.ladder, "ladder", "",
-		"要跑的档位：留空/all = 全部四档；genuine = 只跑真值档；junk = 只跑前置三档；也可给逗号分隔的档位 ID")
 
-	fs.DurationVar(&opt.ladderDeadline, "ladder-deadline", 8*time.Second, "前置档（code-check-in / captcha-missing / captcha-forged）的墙钟预算")
 	fs.DurationVar(&opt.captchaDeadline, "captcha-deadline", 23*time.Second, "真值档的墙钟预算")
 	fs.DurationVar(&opt.hookWait, "hook-wait", 10*time.Second, "等待手机 HAR 上报的时长")
 	fs.IntVar(&opt.genuineAttempts, "genuine-attempts", 3,
-		"真值档最多跑几次（每次重取一个新 captchaVerifyParam；`har#3` 抓包里三次提交才成功一次）")
+		"真值档最多跑几次（每次重取一个新 captchaVerifyParam；har#3 抓包里三次提交才成功一次）")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
@@ -153,26 +144,6 @@ func run() error {
 	}
 	logf("读回预热成功：今日考勤记录 %d 条（基线）", len(baseline))
 
-	sample := opt.sample
-	if sample == "" {
-		sample = discoverSampleParam(".")
-		if sample != "" {
-			logf("已从本地 *.har 找到真实 captchaVerifyParam 样本，伪造值将等长")
-		} else {
-			logf("未找到真实样本，伪造值将使用内置字段长度")
-		}
-	} else if !strings.HasPrefix(strings.TrimSpace(sample), "{") {
-		data, readErr := os.ReadFile(sample)
-		if readErr != nil {
-			return fmt.Errorf("读取 sample-file 失败: %w", readErr)
-		}
-		extracted := extractParam(string(data))
-		if extracted == "" {
-			return errors.New("sample-file 里没有找到 captchaVerifyParam")
-		}
-		sample = extracted
-	}
-
 	profile := opt.profile
 	if profile == "" {
 		// 默认复用持久化 profile，让设备指纹「热」起来；--profile 可覆盖。
@@ -181,41 +152,30 @@ func run() error {
 		}
 	}
 
-	ladder, err := probe.ParseLadder(opt.ladder)
+	// 浏览器预热总是要跑的：它产出的真值 captchaVerifyParam 就是整个工具的目的。
+	var captchaSource probe.CaptchaParamSource
+	browserCtx, cancelBrowser := context.WithCancel(ctx)
+	defer cancelBrowser()
+	src, err := chromecaptcha.New(browserCtx, chromecaptcha.Options{
+		Headless:    !opt.headed,
+		UserDataDir: profile,
+		Logf:        logf,
+		Mobile:      opt.mobile,
+		UserAgent:   opt.userAgent,
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("浏览器预热失败: %w", err)
 	}
-	if opt.noBrowser && slices.Contains(ladder, probe.RungCaptchaGenuine) {
-		return errors.New("--ladder 里的 captcha-verify-genuine 需要浏览器，不能与 --no-browser 同用")
-	}
-
-	var (
-		captchaSource probe.CaptchaParamSource
-		browserUA     string
-	)
-	if !opt.noBrowser {
-		browserCtx, cancelBrowser := context.WithCancel(ctx)
-		defer cancelBrowser()
-		src, err := chromecaptcha.New(browserCtx, chromecaptcha.Options{
-			Headless:    !opt.headed,
-			UserDataDir: profile,
-			Logf:        logf,
-			Mobile:      opt.mobile,
-			UserAgent:   opt.userAgent,
-		})
-		if err != nil {
-			return fmt.Errorf("浏览器预热失败: %w", err)
-		}
-		captchaSource = src
-		browserUA = src.UserAgent()
-		defer func() { _ = src.Close() }()
-	}
+	captchaSource = src
+	defer func() { _ = src.Close() }()
 
 	// 可选：让 skl HTTP 客户端与浏览器自称一致（默认保持项目自报名）。
 	switch {
 	case opt.clientUA == "browser":
+		// 预热总是会跑完才会走到这里，所以 UA 为空只可能是预热没正常完成。
+		browserUA := src.UserAgent()
 		if browserUA == "" {
-			return errors.New("--client-ua browser 需要浏览器预热，不能与 --no-browser 同用")
+			return errors.New("--client-ua browser：浏览器预热的自称为空，无法对齐")
 		}
 		client.SetUserAgent(browserUA)
 	case opt.clientUA != "":
@@ -259,8 +219,8 @@ func run() error {
 		return fmt.Errorf("签到码 %q 不是 4 位数字", code)
 	}
 
-	logf("T0=%s 开始阶梯（Ladder≤%s / 真值≤%s，真值档最多 %d 次）", time.Now().Format("15:04:05"),
-		opt.ladderDeadline, opt.captchaDeadline, opt.genuineAttempts)
+	logf("T0=%s 开始探针（真值档≤%s，最多 %d 次）", time.Now().Format("15:04:05"),
+		opt.captchaDeadline, opt.genuineAttempts)
 
 	prompter := &cliPrompter{out: os.Stderr}
 	rep, err := probe.Run(ctx, probe.Config{
@@ -269,15 +229,11 @@ func run() error {
 		Code:            code,
 		UserID:          user.ID,
 		Coord:           probe.Coord{Lat: opt.lat, Lon: opt.lon},
-		Sample:          sample,
 		Captcha:         captchaSource,
-		SkipGenuine:     opt.noBrowser,
-		Ladder:          ladder,
 		Prompter:        prompter,
 		ReadBack:        probe.ReadBackToday(client),
 		Baseline:        baseline,
 		Hook:            hookCh,
-		LadderDeadline:  opt.ladderDeadline,
 		CaptchaDeadline: opt.captchaDeadline,
 		HookWait:        opt.hookWait,
 		GenuineAttempts: opt.genuineAttempts,
@@ -361,41 +317,6 @@ func isFourDigits(s string) bool {
 		}
 	}
 	return true
-}
-
-// discoverSampleParam 从当前目录的 *.har 里找一份真实 captchaVerifyParam。
-func discoverSampleParam(dir string) string {
-	matches, err := filepath.Glob(filepath.Join(dir, "*.har"))
-	if err != nil {
-		return ""
-	}
-	for _, path := range matches {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		if p := extractParam(string(data)); p != "" {
-			return p
-		}
-	}
-	return ""
-}
-
-// extractParam 从任意文本里提取 captchaVerifyParam 的值（自动 URL 解码）。
-func extractParam(text string) string {
-	const marker = "captchaVerifyParam="
-	idx := strings.Index(text, marker)
-	if idx < 0 {
-		return ""
-	}
-	rest := text[idx+len(marker):]
-	if end := strings.IndexAny(rest, "&\"' \n\r\t"); end >= 0 {
-		rest = rest[:end]
-	}
-	if decoded, err := url.QueryUnescape(rest); err == nil && strings.HasPrefix(decoded, "{") {
-		return decoded
-	}
-	return ""
 }
 
 // lanIP 选一个真正的局域网 IPv4（优先 192.168.*，其次 10.* / 172.16-31.*）。

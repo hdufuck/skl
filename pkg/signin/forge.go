@@ -23,11 +23,10 @@ var ForgeDefaults = struct {
 // 其长度、只把内容换成等长的 'A'；没给样本时用 ForgeDefaults。
 // sceneId 始终沿用真值，样本缺失时用 skl.DefaultCaptchaSceneID。
 //
-// 探针（cmd/signinprobe）与库共用这一份实现，保证两边不会漂移。
-//
 // ⚠️ 结构合法不代表会被接受：伪造值提交到 captcha-verify 后，服务端很可能
 // 让阿里云风控拒签（`captchaVerifyCode:"F014"`：没有初始化记录）；
 // 它的用途正是把「参数层拒绝」与「风控拒绝」分开。
+// 探针（cmd/signinprobe）已不再造伪造参数（见 docs/adr/0004），这个入口留给调用方。
 // 提交它可能写入真实 CheckInRecord，后果由使用者承担。
 func ForgeCaptchaParam(sample string) string {
 	var parsed struct {

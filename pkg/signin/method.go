@@ -10,8 +10,11 @@ import (
 
 // Method 是一条可枚举的签到路径描述符。
 //
-// ID 沿用 cmd/signinprobe 阶梯里的标识，便于把结果写进日志、数据库或报告时
-// 对得上；Title 是直接可展示的中文标题。
+// ID 沿用 cmd/signinprobe 曾经用过的标识，便于把结果写进日志、数据库或报告时
+// 与历史对得上；Title 是直接可展示的中文标题。
+//
+// ⚠️ 这些 ID **不再**与探针阶梯一一对应：探针只跑 `captcha-verify-genuine`
+// （见 docs/adr/0004），其余四条仅由调用方显式使用。
 type Method interface {
 	// ID 是稳定标识，取值见 MethodAnalyzeA0 等常量。
 	ID() string
@@ -21,7 +24,8 @@ type Method interface {
 	SignIn(ctx context.Context, client *skl.Client, req Request) (*Outcome, error)
 }
 
-// 稳定的方法 ID；与探针阶梯的档位逐字对应。
+// 稳定的方法 ID；历史与探针阶梯的档位 ID 同形，但探针现在只跑 Genuine 一档
+// （见 docs/adr/0004）。
 const (
 	MethodAnalyzeA0      = "analyze-a0"
 	MethodCodeCheckIn    = "code-check-in"

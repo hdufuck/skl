@@ -1,4 +1,4 @@
-# 签到探针手册：判定 `CaptchaEnforcement` 并验证库的签到封装路径
+# 签到探针手册：验证库的签到封装路径（并取回活路径成功样本）
 
 本文是**唯一**的签到实验文档，取代旧的 `signin-experiment.md`，并吸收了一份
 未入库的浏览器取参研究草稿。它同时承担三件事：
@@ -7,9 +7,14 @@
 2. `cmd/signinprobe` 的操作手册（预置、相位、读回记录、落盘）；
 3. 浏览器取参（chromedp）的技术附录。
 
-> **只能做一次。** 只能用真实有效的 `SignInCode` 判定，而它由现场生成、有效期未知、
+> **只能做一次。** 只能用真实有效的 `SignInCode` 验证，而它由现场生成、有效期未知、
 > 无法事后复现；实验本身会写入真实 `CheckInRecord`。窗口之前必须把第 4.1 节的预置
-> 全部练完。相关决定见 [`adr/0002`](adr/0002-本机探针与浏览器取参的取舍.md)。
+> 全部练完。相关决定见 [`adr/0002`](adr/0002-本机探针与浏览器取参的取舍.md) 与
+> [`adr/0004`](adr/0004-阶梯只保留真值档.md)。
+>
+> **本工具只跑真值档**（官方 SDK 真值 → 库 `SignIn`）。「人机验证是否强制」按
+> **强制**的前提运作、不再探测：活路径必带参数、遗留端点零调用者、缺参只有单边结果，
+> 而前置档还会在真值档之前打进去几次被风控拒的提交（见 ADR 0004）。
 
 ## 📱 抓包端配置速查（完整步骤见 [§4.3](#43-抓包端要做什么逐步)）
 
@@ -40,14 +45,18 @@ Reqable 手机 App 有两种模式，**上报服务器要配在「流量真正�
 
 | 判据 | 强度 |
 | --- | --- |
-| 阶梯中「未携带真凭证」的档位让**到课**记录增加（`rightCount`） | **强**（唯一的干净归因来源） |
+| 真值档（官方 SDK 参数 + 库 `SignIn`）成功 | **强**（证明库的封装路径可用） |
+| 手机端上报的官方签到成功 | **强**（独立的权威样本） |
 | 响应体明确指向风控（`captchaVerifyResult===false`、`captchaVerifyCode==="F001"`） | **强**（但只证明「阿里云风控拒了」，见 §0.1） |
 | 响应体明确指向参数层（活路径 `400` + 参数缺失/非法） | **强** |
-| 真值档（官方 SDK 参数 + 库 `SignIn`）成功 | **强**（证明库的封装路径可用） |
 | `414` + `text/plain` `URI too long`（带 `X-Kong-Response-Latency`） | **强指网关**：请求行超长，应用层没收到 —— 既不是人机层也不是参数层，必须单独判。`413` 同类但未实测 |
-| 遗留端点 `/checkIn/code-check-in`、`/ali-nvc/check-code-analyze` 成功 | 强（证明不强制）；**失败不可解释**（单边证据） |
 | 本机发出的探针失败 | **弱**：可能是客户端指纹/WAF 导致，不足以单独定论（见 ADR 0002） |
 | `401 签到码不存在` | **无**：签到码校验先于风控校验 |
+| `200 + 空 body`、超时、文案不明 | 无（工具/网络层） |
+
+> 这张表里曾经有一条「未携带真凭证的档位让到课记录增加 = 强」——它随
+> 前置三档一起被删掉了（那个档位本身就是一次未鉴权的写入尝试，见
+> [`adr/0004`](adr/0004-阶梯只保留真值档.md)）。
 | `200 + 空 body`、超时、文案不明 | 无（工具/网络层） |
 
 **归因规则**：本机探针与手机端官方客户端结论冲突时，**以手机端为准**。
@@ -193,46 +202,42 @@ const L = a => { a && z.replace("/sign/in/detail") };
 
 ⟹ `expiresIn` 是**时长（毫秒）**，不是时间戳（旧文档此处写反了）。
 ⟹ **不能再假设窗口宽裕**：脚本的默认预算是 `8s（阶梯）+ 23s（真值档）= 31s`，
-比一个 20 秒的窗口还长。窗口前按 `--ladder-deadline` / `--captcha-deadline`
-自己收紧（例如 `4s + 12s`），或先把真值档的取参链路演练到稳定。
-真值档现在默认最多跑 3 次（每次重取一个新 `captchaVerifyParam`），见第 2 节。
+比一个 20 秒的窗口还长。窗口前按 `--captcha-deadline` 自己收紧（例如 `12s`），
+或先把真值档的取参链路演练到稳定。
+真值档默认最多跑 3 次（每次重取一个新 `captchaVerifyParam`），见第 2 节。
 
 ## 2. 角色分工与阶梯
 
-三个消费者，职责不重叠：
+两个消费者，职责不重叠：
 
 | 消费者 | 提供什么 |
 | --- | --- |
-| **前置三档（本机 Go）** | 复现「遗留 `code-check-in` / 缺失凭证 / 伪造凭证」三条请求形状，并把每档之后的考勤记录原样记下来 |
 | **真值档（chromedp 真值 → 库 `SignIn`）** | 回答「库的 `SignIn` 封装路径能否走通」+ 取得活路径成功样本 |
 | **手机（钉钉 + Reqable）** | 独立的、**权威的**官方成功样本（acceptance criterion 的保险） |
 
-阶梯按「越依赖人机越靠后」排列，顺序即开火顺序：
+本机只有一档：
 
-| # | 档位 ID | 请求 | 凭证 |
-| --- | --- | --- | --- |
-| 1 | `code-check-in` | `GET /checkIn/code-check-in`，带定位 | 无 |
-| 2 | `captcha-verify-missing` | `POST /ali-nvc/captcha-verify` | **缺失** |
-| 3 | `captcha-verify-forged` | 同上 | **伪造**（结构合法、等长） |
-| 4 | `captcha-verify-genuine` | 同上，走库的 `SignIn` | 官方 SDK **真值**（失败则换新参数，最多 3 次） |
+| 档位 ID | 请求 | 凭证 |
+| --- | --- | --- |
+| `captcha-verify-genuine` | `POST /ali-nvc/captcha-verify`，走库的 `SignIn` | 官方 SDK **真值**（失败则换新参数，最多 3 次） |
 
-**顺序可以用 `--ladder` 改**（`all`｜`genuine`｜`junk`｜逗号分隔的档位 ID）：
-前置三档会向同一个 `userid`+`scene` 打进去几次风控不通过的提交，紧接着就是真值档，
-是「真值档为什么 F001」的混淆因子。**真窗口建议 `--ladder genuine`**（只跑真值档，
-把前置三档留给 `--no-browser` 的演练），这样报告里那一条 T001 就是干净的。
+> 曾经的 `code-check-in` / `captcha-verify-missing` / `captcha-verify-forged` 三档
+> 已整个删掉（含 `--ladder` / `--no-browser`）：活路径必带参数、遗留端点零调用者、
+> 缺参只有单边结果，而它们会在真值档之前向同一个 `userid`+`scene` 打进去几次被风控
+> 拒的提交，把 `F001` 的归属搅浑。决策与后果见
+> [`adr/0004`](adr/0004-阶梯只保留真值档.md)。
 
 ### 2.1 时间预算（T0 = 签到码输入完成）
 
 | 相位 | 预算 | 超时行为 |
 | --- | --- | --- |
-| 前置三档 | ≤ 8s | 跳过剩余、继续 |
 | 真值档（浏览器取参 + 提交，含最多 3 次重取） | ≤ 23s | 放弃浏览器、优先保手机 |
 | 手机官方签到 | ≥ 7s | — |
 | 等 Reqable 上报 | ≤ 10s | 记 `hookMissing: true`，不阻塞 |
 
-> ⚠️ 上面的默认值合计 **31s**，而 `har#3` 实测过一个 **20s** 的窗口（见 1.5）。
-> 真窗口比 31s 短时，靠 `--ladder-deadline` / `--captcha-deadline` 收紧；
-> 真值档的 `--genuine-attempts`（默认 3）也直接吃这段预算。
+> ⚠️ 默认值合计 **33s**，而 `har#3` 实测过一个 **20s** 的窗口（见 1.5）。
+> 真窗口比这短时用 `--captcha-deadline` 收紧；真值档的 `--genuine-attempts`
+> （默认 3）也直接吃这段预算。
 
 ### 2.0 真值档为什么要重取参数
 
@@ -260,16 +265,15 @@ const L = a => { a && z.replace("/sign/in/detail") };
 
 ### 2.2 不做判读、不做闸门
 
-工具**只记录**：每档请求之后把当时的今日考勤记录原样抄进报告，不判成败，
-也不因写入而停。一次真实窗口的代价太高，默认把前置三档 + 真值档全部打完，
-由人事后看报告。
+工具**只记录**：真值档请求之后把当时的今日考勤记录原样抄进报告，不判成败，
+也不因写入而停（一次真实窗口的代价太高，先把它拿全），由人事后看报告。
 
-> 只想要前三档就加 `--no-browser`；工具不再有写入闸门 / `--stop-after-write`。
+> 工具没有写入闸门，也没有 `--stop-after-write`。
 
 ## 3. 读回：只记录，不判读
 
-- 每档请求之后调用 `GET /api/check-in-student-detail/my?startDate=<今天>&endDate=<今天>`，
-  把返回的**原始 JSON 数组**原样记进该档的 `afterRequest`（`.md` 草稿按 §4.4 打码）。
+- 真值档请求之后调用 `GET /api/check-in-student-detail/my?startDate=<今天>&endDate=<今天>`，
+  把返回的**原始 JSON 数组**原样记进 `afterRequest`（`.md` 草稿按 §4.4 打码）。
   不解析、不比对、不判成败。
 - T0 前另记一次基线条数（`baselineCount`）。
 - 元素形态从未实测（HAR 里恒为 `[]`；真实窗口里观察到过 1 条且**没有 `id`**、状态未知），
@@ -300,8 +304,8 @@ const L = a => { a && z.replace("/sign/in/detail") };
 2. **凭据**：`export HDU_USER=… HDU_PASS=…`（或已有 `SKL_TOKEN`）。
 3. **定位**：默认写死 `30.313816, 120.343228`（覆盖杭电教学楼 2km 半径），
    可用 `--lat/--lon` 或 `SKL_LAT/SKL_LON` 覆盖。
-4. **伪造样本**：把一份含真实 `captchaVerifyParam` 的 HAR 放在当前目录，
-   脚本会自动提取并让伪造值等长（也可 `--sample-file`）。
+4. ~~伪造样本~~：不再需要——伪造档已删（见 [`adr/0004`](adr/0004-阶梯只保留真值档.md)），
+   脚本不再从 `*.har` 里找样本。
 5. **Reqable 上报服务器**（完整步骤见 4.3）：按抓包模式二选一——
    - 协同模式（手机连电脑）：**电脑端** Reqable → 工具 → 报告服务器 → 添加配置；
    - 独立模式（手机自抓）：**手机端** Reqable → ⋮ → 更多 → 上报服务器（需 ≥ v2.20.0）。
@@ -310,8 +314,7 @@ const L = a => { a && z.replace("/sign/in/detail") };
    需要登录一个免费 Reqable 账号（Community 档 1 条规则足够）。
 6. **演练**：用**无效**签到码完整跑一遍脚本，确认
    - 读回端点能解析（打印出「读回预热成功」）；
-   - 前置三档都在 8s 内返回 `401 签到码不存在`；
-   - **真值档也拿到了 HTTP 状态**（无效码同样是 `401 签到码不存在`）——
+   - **真值档拿到了 HTTP 状态**（无效码是 `401 签到码不存在`）——
      只看到「官方验证码 SDK 已就绪」不算通过：那条日志只证明预热成功，
      不证明 `New` 返回之后浏览器还活着；
    - 手机上报能在 10s 内到达（`hookMissing` 为 false）。
@@ -322,13 +325,10 @@ const L = a => { a && z.replace("/sign/in/detail") };
 ### 4.2 T0 流程
 
 ```bash
-go run ./cmd/signinprobe            # 默认：headless=new + 桌面 Chrome 自称、hook :8080、全部四档
-# 真窗口推荐（只跑真值档，避免前置三档污染 F001 归因）：
-#   go run ./cmd/signinprobe --ladder genuine
-# 可选：--headed  --profile <目录>  --no-browser  --hook ""  --out probe-results
-#      --ladder all|genuine|junk|<档位ID列表>  --mobile  --ua '<UA 字符串>'
-#      --client-ua browser|'<UA 字符串>'  （默认：项目自报名，不对齐）
-#      --ladder-deadline 4s  --captcha-deadline 12s  --genuine-attempts 2
+go run ./cmd/signinprobe            # 默认：headless=new + 桌面 Chrome 自称、hook :8080
+# 可选：--headed  --profile <目录>  --hook ""  --out probe-results
+#      --mobile  --ua '<UA 字符串>'  --client-ua browser|'<UA 字符串>'
+#      --captcha-deadline 12s  --genuine-attempts 2
 ```
 
 补充说明：
@@ -344,18 +344,18 @@ go run ./cmd/signinprobe            # 默认：headless=new + 桌面 Chrome 自�
   `signinprobe/chrome-profile`），让设备指纹「热」起来；`--profile` 可改路径。
 - 签到码**主路径是 stdin 交互输入**；`--code <4位>` 只是给演练/自动化用的显式覆盖
   （签到码本身无隐私，见 Q6），真实窗口建议仍用交互输入。
-- `--no-browser` 只跑前置三档（演练用，不需要 Chrome）。
 
 T0 后的时序：
 
 1. 脚本登录、预热读回、预热浏览器、起 hook 服务，打印 Reqable 接收地址；
 2. 提示 `请输入老师公布的 4 位签到码（输入后立即开始计时）`；
 3. 你输入 4 位码 → **T0**；
-4. 前置三档自动打完（约 3–5s），每档之后记录一次当时的考勤记录；
-5. 真值档：浏览器点触发按钮 → 静默出参 → 库 `SignIn` 提交；
-6. **脚本提示「现在请在手机上完成一次官方签到」** → 你立刻去手机操作（见 4.3）；
-7. 最多等 10s 收手机 HAR；
-8. 输出 `probe-results/<时间戳>.json`（原始、gitignored）与 `.md`（脱敏草稿）。
+4. 真值档：浏览器点触发按钮 → 静默出参 → 库 `SignIn` 提交（约 2–5s）；
+   失败属于「值得换新参数重取」那两类时自动重取，最多 `--genuine-attempts` 次；
+   请求之后记录一次当时的考勤记录；
+5. **脚本提示「现在请在手机上完成一次官方签到」** → 你立刻去手机操作（见 4.3）；
+6. 最多等 10s 收手机 HAR；
+7. 输出 `probe-results/<时间戳>.json`（原始、gitignored）与 `.md`（脱敏草稿）。
 
 ### 4.3 抓包端要做什么（逐步）
 
@@ -454,7 +454,7 @@ T0 后的时序：
 
 | 项 | 原因 |
 | --- | --- |
-| **`CaptchaEnforcement`（人机是否强制）** | `har#3` 的采集**没有**「有效签到码 + 缺失 `captchaVerifyParam`」的尝试；只证明了「有效码 + 人机不通过」= `200 F001` |
+| **`CaptchaEnforcement`（人机是否强制）** | **不再是本工具的问题**：按「强制」前提运作，前置三档已删（[`adr/0004`](adr/0004-阶梯只保留真值档.md)）。注意这**不是已实测**：缺参只会拿到 `401`，属于单边证据（ADR 0001/0002） |
 | `captchaVerifyParam` 一次性 / 有效期 | 5 个 `certifyId` 各用一次，无重放；只能确认 `InitCaptcha` 会把上次的 `certifyId` 带回去（`reInitCaptcha`） |
 | 人机判 `F001` 的成因 | 参数是真值（距 init 仅 4.25 s）却被人机拒；官方措辞只是「疑似攻击请求，风险策略不通过」（见 §0.1），风控评分、环境自称、前两次 414 都可能，**不可区分**。`har#3` 里一台真桌面 Edge 也先吃过一次才成功 ⟹ 环境自称缺陷**不是充分原因**。本轮已把能看见的自相矛盾去掉（附录 A.2），这仍然只是「没理由不修」，不是因果 |
 | 本次成功是否**真的写入**了记录 | 成功后的 `rightCount:1` 只在成功后读了一次，**无基线**；成功 + 跳转 `/sign/in/detail` 是强旁证而非写入证明 |
@@ -573,4 +573,4 @@ cloudauth-device 请求）时只等 grace 1.5s。⚠️ 这一步**只消除竞�
 | 自称实测（本机） | `internal/chromecaptcha/presentation_test.go`（离线护栏）+ 临时程序（已删） | `--headless=new` 的 UA 是 `HeadlessChrome/153.0.0.0`；屏幕 800×600 / dpr 1；`setUserAgentOverride` **不带** metadata 时 `Sec-CH-UA-*` 整批消失；`navigator.userAgentData` 在 `about:blank` 上是 `undefined`；移动端视口 <393px 会被 Chrome 自己缩放 |
 | 设备指纹时序 | `har#4` | `InitCaptcha` +0.18s（铸 `deviceToken`）→ Log2 +0.49s → Log3 +3.42s → 第一次点击 +3.45s ⟹ 预热要等「落地」，见附录 A.2 |
 | 阿里云错误码 | 官方《客户端返回数据说明》 | `F001` = 「疑似攻击请求，风险策略不通过」（不是「人机层单独拒签」）；`F009` 点名「桌面浏览器模拟移动设备」。全表见 §0.1 |
-| 阶梯顺序 | `internal/probe/ladder_test.go` | `--ladder` 可选档位；真窗口建议只跑真值档，避免前置三档的失败提交污染 F001 归因 |
+| 阶梯收敛 | [`adr/0004`](adr/0004-阶梯只保留真值档.md) + `internal/probe/` | 删掉 `code-check-in` / `captcha-verify-missing` / `captcha-verify-forged`，只跑真值档；理由：活路径必带参数、遗留端点零调用者、缺参只有单边结果、前置档是 F001 归因的混淆因子且带着写入风险 |

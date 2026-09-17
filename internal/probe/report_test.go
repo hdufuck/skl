@@ -26,17 +26,9 @@ func TestGenuineUnproven(t *testing.T) {
 			want:    false,
 		},
 		{
-			name:    "没跑真值档（--no-browser）不算未验证",
-			entries: []Entry{{Rung: RungCaptchaForged, Status: 401}},
+			name:    "报告里没有真值档记录",
+			entries: []Entry{{Rung: RungPhoneCaptcha, Status: 401}},
 			want:    false,
-		},
-		{
-			name: "前面的档没拿到状态不算在真值档头上",
-			entries: []Entry{
-				{Rung: RungLegacyCheckIn, Err: "connection refused"},
-				{Rung: RungCaptchaGenuine, Status: 401},
-			},
-			want: false,
 		},
 	}
 
@@ -55,7 +47,7 @@ func TestMarkdownWarnsWhenGenuineUnproven(t *testing.T) {
 	rep := &Report{
 		Version: "signinprobe/test",
 		Entries: []Entry{
-			{Rung: RungCaptchaGenuine, ParamKind: ParamGenuine,
+			{Rung: RungCaptchaGenuine,
 				Err: "probe: 获取真值 captchaVerifyParam: chromecaptcha: 触发验证码失败: context canceled"},
 		},
 	}
@@ -84,7 +76,6 @@ func TestMarkdownRendersAttempts(t *testing.T) {
 		Entries: []Entry{
 			{
 				Rung:              RungCaptchaGenuine,
-				ParamKind:         ParamGenuine,
 				Status:            200,
 				CaptchaVerifyCode: "T001",
 				Body:              `{"captchaVerifyResult":true,"captchaVerifyCode":"T001","checkCodeDto":{"id":"x"}}`,
@@ -121,9 +112,8 @@ func TestMarkdownRendersAndMasksAfterRequest(t *testing.T) {
 		UserID:  "24000000",
 		Entries: []Entry{
 			{
-				Rung:      RungCaptchaGenuine,
-				ParamKind: ParamGenuine,
-				Status:    200,
+				Rung:   RungCaptchaGenuine,
+				Status: 200,
 				AfterRequest: []json.RawMessage{
 					json.RawMessage(`{"id":"zvQfKIM6bzPrJeteS1T","studentId":"24000000","right":true}`),
 				},
