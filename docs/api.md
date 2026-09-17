@@ -55,6 +55,10 @@ https://skl.hdu.edu.cn/api
 `401` 不是「空 body」：业务失败会带 JSON。两个键（`url` / `msg`）就是区分
 会话失效与业务失败的唯一判据。
 
+⚠️ **权限拒绝不一定走 `403`**：实测（见 §5）`GET /checkIn/course-check-in-count`
+在非任课老师访问时返回 `400 + {"code":0,"msg":"非任课老师无权查看"}`。
+因此判断是否属于权限问题，要看 `msg` 文案，不能只看状态码。
+
 ### 1.3 参数约定
 
 - 日期：`2006-01-02`（如 `startTime=2006-01-02`、`startDate`/`endDate`）
@@ -287,7 +291,7 @@ GET  /cas/login?ticket= → 302 → https://skl.hdu.edu.cn/index.html#?token=<uu
 | POST | `/checkIn/update` | body | 📖 | 改单个学生状态 |
 | POST | `/checkIn/update-all` | body | 📖 | 批量改考勤 |
 | POST | `/checkIn/reset` | body | 📖 | 清空记录 |
-| GET | `/checkIn/course-check-in-count` | `courseId` | 📖 | |
+| GET | `/checkIn/course-check-in-count` | `courseId` | ✅端点 / 📖响应 | 角色门已实测：学生 token → `400 {"code":0,"msg":"非任课老师无权查看"}`（未读到数据）；教师 200 的响应形状未测 |
 | GET | `/checkIn/all-course-check-in-count` | `params` | 📖 | |
 
 **`distance` 语义**：服务端用「老师生成签到码时的定位」与「学生签到时的定位」
@@ -392,7 +396,7 @@ GET  /cas/login?ticket= → 302 → https://skl.hdu.edu.cn/index.html#?token=<uu
 | `check-code-analyze` 的 `code` 语义 | 📖 前端传的是定位就绪标志（布尔），与签到码无关；所在路由不可达 |
 | `/checkIn/stu-check-count` 的 `list` 元素 | 实测为 `[]`（**基线为空**，不是接口失明） |
 | `/check-in-student-detail/*` 响应元素 | 实测为 `[]`（同上） |
-| 各接口的角色权限边界 | 未逐个验证；403 文案为「没有权限」 |
+| 各接口的角色权限边界 | 未逐个验证；403 文案为「没有权限」。**已实测一例**：学生 token 打 `GET /checkIn/course-check-in-count?courseId=<本人课程>` → `400 {"code":0,"msg":"非任课老师无权查看"}`（权限拒绝走 400 + 业务 msg，不是 403；未读到任何数据） |
 | `CheckInCount` 中课程信息字段 | ⚠️ 结构存疑：实测元素是**身份字段**（`id`/`userId`/`classNo`/`name`/`major`/`unitCode`/`unitName`/`grade`/`studyLevel`），库里补的是 `courseCode` 系字段 |
 | `checkCodeDto` 内部结构 | ✅ 17 个字段已实测（见 3.2 与样本文档） |
 | `captchaVerifyParam` 一次性 / 有效期 | ⚠️ 本次不证明：抓包里 5 个 `certifyId` 各用一次，无重放 |
