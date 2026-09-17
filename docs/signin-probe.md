@@ -218,9 +218,9 @@ const L = a => { a && z.replace("/sign/in/detail") };
 
 每档之后做读回 diff；一旦发现**新增记录**：
 
-- 默认（交互）：命令行打印告警，**5 秒倒计时**；`c` 回车继续，回车/超时则停止。
-- `--continue-after-write`：不询问，跑完全部档位。
-- 停止时报告记 `stoppedAt`。
+- 默认：不打断，**自动跑完全部档位** —— 一次真实窗口的代价太高，先把结论拿全。
+- `--stop-after-write`：恢复「首个写入即停」纪律，命令行打印告警，**5 秒倒计时**；
+  `c` 回车继续，回车/超时则停止，并在报告里记 `stoppedAt`。
 
 > 只用命令行文字提示，**不响铃**。
 
@@ -278,9 +278,9 @@ const L = a => { a && z.replace("/sign/in/detail") };
 ### 4.2 T0 流程
 
 ```bash
-go run ./cmd/signinprobe            # 默认：headless=new、hook :8080、阶梯 8s + 真值 23s
+go run ./cmd/signinprobe            # 默认：headless=new、hook :8080、阶梯 8s + 真值 23s、写入后继续
 # 可选：--headed  --profile <目录>  --no-browser  --hook ""  --out probe-results
-#      --ladder-deadline 4s  --captcha-deadline 12s  --genuine-attempts 2
+#      --ladder-deadline 4s  --captcha-deadline 12s  --genuine-attempts 2  --stop-after-write
 ```
 
 补充说明：
@@ -296,7 +296,7 @@ T0 后的时序：
 1. 脚本登录、预热读回、预热浏览器、起 hook 服务，打印 Reqable 接收地址；
 2. 提示 `请输入老师公布的 4 位签到码（输入后立即开始计时）`；
 3. 你输入 4 位码 → **T0**；
-4. 档 1–4 自动打完（约 3–5s）；若某档写入，按第 2.2 节处理；
+4. 档 1–4 自动打完（约 3–5s）；若某档写入，按第 2.2 节处理（默认继续，`--stop-after-write` 才停）；
 5. 档 5：浏览器点触发按钮 → 静默出参 → 库 `SignIn` 提交；
 6. **脚本提示「现在请在手机上完成一次官方签到」** → 你立刻去手机操作（见 4.3）；
 7. 最多等 10s 收手机 HAR；
