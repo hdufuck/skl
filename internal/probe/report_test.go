@@ -1,13 +1,14 @@
 package probe
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 )
 
 // GenuineUnproven 是演练（--code 0000）里「真值档到底有没有跑起来」的唯一硬信号：
-// transport_error 说明请求根本没发出去，不是「真值档失败」。
+// 连 HTTP 状态都没拿到，说明请求根本没发出去，不是「真值档失败」。
 func TestGenuineUnproven(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -15,25 +16,25 @@ func TestGenuineUnproven(t *testing.T) {
 		want    bool
 	}{
 		{
-			name:    "真值档 transport_error",
-			entries: []Entry{{Rung: RungCaptchaGenuine, Verdict: VerdictTransportError}},
+			name:    "真值档没拿到状态",
+			entries: []Entry{{Rung: RungCaptchaGenuine, Err: "chromecaptcha: 触发验证码失败"}},
 			want:    true,
 		},
 		{
 			name:    "真值档拿到了 401",
-			entries: []Entry{{Rung: RungCaptchaGenuine, Status: 401, Verdict: VerdictCodeRejected}},
+			entries: []Entry{{Rung: RungCaptchaGenuine, Status: 401}},
 			want:    false,
 		},
 		{
 			name:    "没跑真值档（--no-browser）不算未验证",
-			entries: []Entry{{Rung: RungCaptchaForged, Status: 401, Verdict: VerdictCodeRejected}},
+			entries: []Entry{{Rung: RungCaptchaForged, Status: 401}},
 			want:    false,
 		},
 		{
-			name: "前面的档 transport_error 不算在真值档头上",
+			name: "前面的档没拿到状态不算在真值档头上",
 			entries: []Entry{
-				{Rung: RungAnalyzeA0, Verdict: VerdictTransportError},
-				{Rung: RungCaptchaGenuine, Status: 401, Verdict: VerdictCodeRejected},
+				{Rung: RungLegacyCheckIn, Err: "connection refused"},
+				{Rung: RungCaptchaGenuine, Status: 401},
 			},
 			want: false,
 		},
@@ -54,7 +55,7 @@ func TestMarkdownWarnsWhenGenuineUnproven(t *testing.T) {
 	rep := &Report{
 		Version: "signinprobe/test",
 		Entries: []Entry{
-			{Rung: RungCaptchaGenuine, ParamKind: ParamGenuine, Verdict: VerdictTransportError,
+			{Rung: RungCaptchaGenuine, ParamKind: ParamGenuine,
 				Err: "probe: 获取真值 captchaVerifyParam: chromecaptcha: 触发验证码失败: context canceled"},
 		},
 	}
@@ -87,7 +88,6 @@ func TestMarkdownRendersAttempts(t *testing.T) {
 				Status:            200,
 				CaptchaVerifyCode: "T001",
 				Body:              `{"captchaVerifyResult":true,"captchaVerifyCode":"T001","checkCodeDto":{"id":"x"}}`,
-				Verdict:           VerdictSuccess,
 				Note:              "人机判定为 false ⟹ 换一个新参数重取",
 				Attempts: []Attempt{
 					{Status: 414, URLLen: 27847, Body: "URI too long\n",
@@ -113,30 +113,33 @@ func TestMarkdownRendersAttempts(t *testing.T) {
 	}
 }
 
-// 落盘草稿里不能出现考勤记录主键（它能追回那一条记录）；哈希形态不指向人，保留。
-func TestMarkdownMasksRecordKeys(t *testing.T) {
+// 每档请求之后读到的考勤记录要落进 md 草稿，且按 §4.4 打码：
+// 记录主键（`id`）必须打掉，学号只留前 2 后 1。
+func TestMarkdownRendersAndMasksAfterRequest(t *testing.T) {
 	rep := &Report{
 		Version: "signinprobe/test",
 		UserID:  "24000000",
 		Entries: []Entry{
-			{Rung: RungCaptchaGenuine, ParamKind: ParamGenuine, Status: 200,
-				Before: 0, After: 1, Verdict: VerdictSuccess,
-				NewKeys: []string{"id:zvQfKIM6bzPrJeteS1T", "sha256:deadbeef"}},
+			{
+				Rung:      RungCaptchaGenuine,
+				ParamKind: ParamGenuine,
+				Status:    200,
+				AfterRequest: []json.RawMessage{
+					json.RawMessage(`{"id":"zvQfKIM6bzPrJeteS1T","studentId":"24000000","right":true}`),
+				},
+			},
 		},
 	}
+
 	md := rep.Markdown()
 	if strings.Contains(md, "zvQfKIM6bzPrJeteS1T") {
 		t.Fatalf("记录主键泄漏: \n%s", md)
 	}
-	// 期望值由 MaskID 推出，避免在测试里手数星号。
-	if want := "id:" + MaskID("zvQfKIM6bzPrJeteS1T"); !strings.Contains(md, want) {
-		t.Fatalf("记录主键应被打码成 %q: \n%s", want, md)
-	}
-	if !strings.Contains(md, "sha256:deadbeef") {
-		t.Fatalf("哈希形态不指向人，应保留: \n%s", md)
-	}
 	if strings.Contains(md, "24000000") {
 		t.Fatalf("学号泄漏: \n%s", md)
+	}
+	if !strings.Contains(md, "<记录主键，已打码>") {
+		t.Fatalf("记录主键应被打码: \n%s", md)
 	}
 	if !strings.Contains(md, "24*****0") {
 		t.Fatalf("学号应被打码: \n%s", md)

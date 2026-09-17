@@ -41,7 +41,7 @@ _Avoid_: token、sessionId、X-Auth-Token
 _Avoid_: ticket、nonce、skl-ticket
 
 **签到方式 Method**:
-`pkg/signin` 里一条可枚举的签到路径，ID 与探针阶梯的档位逐字对应（`analyze-a0` / `code-check-in` / `captcha-verify-missing` / `captcha-verify-forged` / `captcha-verify-genuine`）。
+`pkg/signin` 里一条可枚举的签到路径，ID 与探针阶梯的档位逐字对应（`analyze-a0` / `code-check-in` / `captcha-verify-missing` / `captcha-verify-forged` / `captcha-verify-genuine`）。**例外**：`analyze-a0` 只是库里的可显式调用路径，探针阶梯已不再走它——它即使拿到有效签到码也只回 `{"result":{"code":800}}`（被拒），失败不可解释。
 _Avoid_: rung、阶梯档位（那是探针内部的说法）
 
 **签到结果 Outcome**:

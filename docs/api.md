@@ -44,7 +44,7 @@ https://skl.hdu.edu.cn/api
 | 形态 | 含义 |
 | --- | --- |
 | `200` + JSON | 正常；但也可能是**业务失败**（见下面两行） |
-| `200` + `{"captchaVerifyResult":false,"captchaVerifyCode":"F001"}` | **人机判定失败**（不是 401）。签到的失败判定见 §3.2 |
+| `200` + `{"captchaVerifyResult":false,"captchaVerifyCode":"F001"}` | **阿里云风控不通过**（`F001` 的官方措辞是「疑似攻击请求，风险策略不通过」，见 §0.1）。签到的失败判定见 §3.2 |
 | `200` + **空 body** | `skl-ticket` 重放，或（未证实）被限流。**不能用状态码判断成败** |
 | `400` + `{"code":0,"msg":"..."}` | 参数缺失/非法（如 `Request method 'POST' is not supported`） |
 | `401` + `{"code":0,"msg":"..."}` | **业务校验失败**（如「签到码不存在，不要玩我」） |
@@ -145,8 +145,15 @@ GET  /cas/login?ticket= → 302 → https://skl.hdu.edu.cn/index.html#?token=<uu
 | 字段 | 类型 | 说明 | 等级 |
 | --- | --- | --- | --- |
 | `captchaVerifyResult` | bool | 服务端对本次 `CaptchaVerifyParam` 的判定 | ✅ |
-| `captchaVerifyCode` | string | 成功 `T001` / 人机失败 `F001`。此前未知；前端不消费它 | ✅ |
+| `captchaVerifyCode` | string | 成功 `T001` / 风控不通过 `F001`。此前未知；前端不消费它 | ✅ |
 | `checkCodeDto` | object | 成功时是 `CheckInRecord` 详情；**失败时整个键不存在**（17 个字段见样本文档） | ✅ |
+
+`captchaVerifyCode` 是**阿里云验证码**的错误码，不是 skl 自己的码：`F001` 的官方定义是
+「疑似攻击请求，风险策略不通过」（原文摘要与完整表见
+[签到探针手册 §0.1](./signin-probe.md#01-阿里云验证码错误码原文摘要)）。
+所以它指向的是**风控评分**，不能读成「人机验证层单独拒签」——
+同一份参数换取一次就可能变成 `T001`（`har#3` 抓包第 98→101 条，官方 SDK 自己也在
+`F001` 后 `reInitCaptcha`）。
 
 `captchaVerifyCode`/`F001`/`T001` 这三个字面量对 `har#3` 抓包里的**全部前端产物**
 （含 5 个 `cx.*` 交互模块、`AliyunCaptcha.js`、FeiLin 设备指纹 JS）做字面检索，
@@ -157,7 +164,7 @@ GET  /cas/login?ticket= → 302 → https://skl.hdu.edu.cn/index.html#?token=<uu
 | 形态 | 含义 |
 | --- | --- |
 | `200` + `captchaVerifyResult:true` + 非空 `checkCodeDto` | 签到成功 |
-| `200` + `captchaVerifyResult:false` + `captchaVerifyCode:\`F001\`` | **人机层单独拒签**。同一有效签到码换一个 `captchaVerifyParam` 就会走这里 |
+| `200` + `captchaVerifyResult:false` + `captchaVerifyCode:\`F001\`` | **阿里云风控不通过**（官方措辞：「疑似攻击请求，风险策略不通过」，见 §0.1 的错误码表）。同一有效签到码换一个 `captchaVerifyParam` 就可能走通——`har#3` 抓包里第 3 次提交就是这样成功的 |
 | `401` + `{"code":0,"msg":"签到码不存在，不要玩我"}` | 签到码校验**先于**人机校验，所以这条对「是否强制」无信息 |
 | `414` + `text/plain` `URI too long` | **网关**拒了超长请求行，应用层没收到。`CaptchaVerifyParam` 里的 `data` 会膨胀到 25 KB 量级 |
 
@@ -395,7 +402,7 @@ GET  /cas/login?ticket= → 302 → https://skl.hdu.edu.cn/index.html#?token=<uu
 | `checkIn/code-check-in` 完整参数集 | ⚠️ 仅知 `code`/`id` 可到达业务逻辑；📖 且现行前端**零调用者** |
 | `check-code-analyze` 的 `code` 语义 | 📖 前端传的是定位就绪标志（布尔），与签到码无关；所在路由不可达 |
 | `/checkIn/stu-check-count` 的 `list` 元素 | 实测为 `[]`（**基线为空**，不是接口失明） |
-| `/check-in-student-detail/*` 响应元素 | 实测为 `[]`（同上） |
+| `/check-in-student-detail/*` 响应元素 | HAR 里恒为 `[]`；真实窗口里观察到过 1 条且**无 `id`**、状态未知。**不能**用它的「新增」判签到成功——判据用 `stu-course-check-in-count.rightCount`（到课），见 §4.2 |
 | 各接口的角色权限边界 | 未逐个验证；403 文案为「没有权限」。**已实测一例**：学生 token 打 `GET /checkIn/course-check-in-count?courseId=<本人课程>` → `400 {"code":0,"msg":"非任课老师无权查看"}`（权限拒绝走 400 + 业务 msg，不是 403；未读到任何数据） |
 | `CheckInCount` 中课程信息字段 | ⚠️ 结构存疑：实测元素是**身份字段**（`id`/`userId`/`classNo`/`name`/`major`/`unitCode`/`unitName`/`grade`/`studyLevel`），库里补的是 `courseCode` 系字段 |
 | `checkCodeDto` 内部结构 | ✅ 17 个字段已实测（见 3.2 与样本文档） |
@@ -423,5 +430,5 @@ SKL_TOKEN=<localStorage.sessionId> go test -tags integration -run TokenOnly -v .
 它会真的签到。
 
 要判定「人机验证是否强制」时，按 **[签到探针手册](./signin-probe.md)** 执行：
-抓包环境、单变量纪律、探针顺序、判读表与脱敏规则都写在那里，
+抓包环境、单变量纪律、探针顺序、每档请求后的考勤记录读回与脱敏规则都写在那里，
 不要临场发挥——那个窗口不可重复。

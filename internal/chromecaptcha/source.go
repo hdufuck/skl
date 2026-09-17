@@ -55,6 +55,28 @@ type Options struct {
 	// Logf 是可选的日志输出。
 	Logf func(format string, args ...any)
 
+	// UserAgent 覆盖浏览器 UA；空串按 Profile 推导（桌面 = 真实 UA 去掉
+	// headless 的 "Headless" 标记；Mobile = 内置的 Android 模板）。
+	//
+	// 比如想直接粘手机端钉钉那串 UA 时用它（记得配 Mobile，否则客户端提示仍是桌面）。
+	UserAgent string
+	// Mobile 为 true 时自称 Android 手机：UA、客户端提示、屏幕几何、触摸能力
+	// 一起换。默认 false（自称一台真实的桌面 Chrome）。
+	Mobile bool
+	// Screen 覆盖自称的屏幕几何；零值字段按 Profile 默认值补齐。
+	//
+	// 桌面：视口保持浏览器现状，只改屏幕（headless 默认的 800×600 / dpr 1
+	// 是虚拟设备签名）。手机：视口就是屏幕。
+	Screen Screen
+	// FingerprintGrace 是「等第一个设备指纹请求出现」的时长（默认 1.5s）。
+	//
+	// 没有出现就当 deviceToken 已缓存，立刻返回。
+	FingerprintGrace time.Duration
+	// FingerprintSettle 是「多久没有新的设备指纹请求」就算落地（默认 4s）。
+	//
+	// 只在页面确实上传过设备指纹时才等待，且发生在 T0 之前，不占窗口预算。
+	FingerprintSettle time.Duration
+
 	// Fulfill 让调用方在真实源下额外接管某些 URL 的响应体（返回 false 表示放行）。
 	//
 	// 生产路径不需要它。离线测试用它把官方 SDK 脚本换成桩，从而不依赖阿里云 CDN
@@ -74,9 +96,24 @@ type Source struct {
 	logf    func(format string, args ...any)
 	fulfill func(rawURL string) (contentType, body string, ok bool)
 
+	// userAgent 是自称生效后浏览器真正使用的 UA（预热结束时才可信）。
+	userAgent string
+	// fp 记录设备指纹上传活动，供 waitFingerprint 判「落地」。
+	fp *fingerprintWatch
+
 	mu        sync.Mutex
 	fromNet   string
 	pageReady bool
+}
+
+// UserAgent 返回自称生效后浏览器使用的 UA。
+//
+// 真值档提交 captchaVerifyParam 时，HTTP 客户端（skl.Client）可以用它对齐自己
+// 的身份，让「铸造参数的浏览器」和「提交参数的客户端」看起来是同一个（可选）。
+func (s *Source) UserAgent() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.userAgent
 }
 
 // New 启动浏览器、交付极简页并等待 SDK 初始化完成。返回的 Source 已经是
@@ -132,6 +169,7 @@ func New(ctx context.Context, opts Options) (*Source, error) {
 		trigger:     "#captcha-trigger-btn",
 		timeout:     opts.StartupTimeout,
 		logf:        opts.Logf,
+		fp:          newFingerprintWatch(),
 	}
 
 	html := renderPage(opts.SceneID, opts.Prefix)
@@ -143,6 +181,9 @@ func New(ctx context.Context, opts Options) (*Source, error) {
 		case *fetch.EventRequestPaused:
 			s.handlePaused(e, body)
 		case *network.EventRequestWillBeSent:
+			if isDeviceFingerprintURL(e.Request.URL) {
+				s.fp.track(e.RequestID, time.Now())
+			}
 			if !strings.Contains(e.Request.URL, skl.PathSignInCaptchaVerify) {
 				return
 			}
@@ -155,6 +196,10 @@ func New(ctx context.Context, opts Options) (*Source, error) {
 				s.fromNet = p
 				s.mu.Unlock()
 			}
+		case *network.EventLoadingFinished:
+			s.fp.finish(e.RequestID, time.Now())
+		case *network.EventLoadingFailed:
+			s.fp.finish(e.RequestID, time.Now())
 		}
 	})
 
@@ -182,12 +227,50 @@ func New(ctx context.Context, opts Options) (*Source, error) {
 		return nil, fmt.Errorf("chromecaptcha: 加载极简页失败: %w", err)
 	}
 
+	// 页面到位后就换掉自称，**然后**才让官方 SDK 开口：SDK 的第一次 InitCaptcha
+	// 会把 UA、客户端提示、屏幕几何一起报给阿里云，必须在它之前换好。
+	//
+	// 为什么不在 Navigate 之前读：`navigator.userAgentData` 只在安全上下文里存在，
+	// about:blank 读出来是 undefined（本机实测）——必须先落到真实源上。
+	// 所以极简页只定义「加载并启动 SDK」，由这里点火（见 renderPage）。
+	ident, err := identify(pageCtx)
+	if err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	// 覆盖必须跑在 chromedp 的 executor ctx 上（ActionFunc 里那个），直接拿
+	// pageCtx 去 Do 会报 invalid context。
+	var ua string
+	err = chromedp.Run(pageCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+		var applyErr error
+		ua, applyErr = applyPresentation(ctx, ident, opts)
+		return applyErr
+	}))
+	if err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	s.mu.Lock()
+	s.userAgent = ua
+	s.mu.Unlock()
+
+	if err := chromedp.Run(pageCtx, chromedp.Evaluate(`window.__loadAndStartSDK(); true`, nil)); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("chromecaptcha: 启动验证码 SDK 失败: %w", err)
+	}
+
 	if err := s.waitReady(pageCtx); err != nil {
 		_ = s.Close()
 		return nil, err
 	}
 	watchdog.Stop()
-	opts.Logf("chromecaptcha: 官方验证码 SDK 已就绪（sceneId=%s prefix=%s）", opts.SceneID, opts.Prefix)
+
+	// 就绪 ≠ 可以点：deviceToken 铸在初始化那一刻，设备指纹数据却要再传几秒。
+	// 这一步只花 T0 之前的时间。
+	s.waitFingerprint(pageCtx, opts.FingerprintGrace, opts.FingerprintSettle)
+
+	opts.Logf("chromecaptcha: 官方验证码 SDK 已就绪（sceneId=%s prefix=%s，自称=%s）",
+		opts.SceneID, opts.Prefix, s.UserAgent())
 	return s, nil
 }
 
@@ -364,7 +447,12 @@ func (s *Source) Close() error {
 	return nil
 }
 
-// renderPage 生成极简验证码页：加载官方 SDK，回调里把参数存到全局变量。
+// renderPage 生成极简验证码页。
+//
+// 关键：页面**不**自动初始化 SDK，只定义 `window.__loadAndStartSDK`，由 Go 在
+// 换好自称之后点火。原因见 New：`navigator.userAgentData` 只在安全上下文里存在，
+// 我们必须先落到这个真实源上才能读出客户端提示，再把 SDK 脚本拉起来 ——
+// 否则第一次 InitCaptcha 就带着 headless 指纹出去了。
 func renderPage(sceneID, prefix string) string {
 	return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -373,35 +461,50 @@ func renderPage(sceneID, prefix string) string {
 <body>
 <div id="captcha-container"></div>
 <button id="captcha-trigger-btn" style="width:360px;height:50px">verify</button>
-<script src="` + skl.AliyunCaptchaScriptURL + `"></script>
 <script>
 (function () {
-  try {
-    window.initAliyunCaptcha({
-      SceneId: "` + sceneID + `",
-      prefix: "` + prefix + `",
-      mode: "popup",
-      element: "#captcha-container",
-      button: "#captcha-trigger-btn",
-      captchaVerifyCallback: function (captchaVerifyParam) {
-        window.__captchaVerifyParam = captchaVerifyParam;
-        window.__captchaAt = Date.now();
-        return { captchaResult: true, bizResult: true };
-      },
-      onBizResultCallback: function () { window.__bizResult = true; },
-      // getInstance 是 SDK 把「构造完成的实例」交回来的时刻：它在 init / bindEvents
-      // 之后才回调（实测 init 后 300–550ms）。**只有到这时触发按钮才真正绑上点击
-      // 处理**，更早的点击会被直接丢掉（表现为点了没反应、取参一路超时，真值档
-      // 于是退化成 transport_error）。就绪标志必须在这里置位，不能像以前那样在
-      // initAliyunCaptcha 返回后同步置位。
-      getInstance: function (instance) {
-        window.__captchaInstance = instance;
-        window.__sdkReady = true;
-      },
-      slideStyle: { width: 360, height: 50 },
-      language: "cn"
-    });
-  } catch (e) { window.__sdkErr = "" + e; }
+  window.__loadAndStartSDK = function () {
+    if (window.__sdkLoading) return;
+    window.__sdkLoading = true;
+    var s = document.createElement("script");
+    s.src = "` + skl.AliyunCaptchaScriptURL + `";
+    s.onerror = function () { window.__sdkErr = "AliyunCaptcha.js 加载失败"; };
+    s.onload = start;
+    document.head.appendChild(s);
+  };
+
+  function start() {
+    try {
+      if (!window.initAliyunCaptcha) {
+        window.__sdkErr = "AliyunCaptcha.js 没有定义 initAliyunCaptcha";
+        return;
+      }
+      window.initAliyunCaptcha({
+        SceneId: "` + sceneID + `",
+        prefix: "` + prefix + `",
+        mode: "popup",
+        element: "#captcha-container",
+        button: "#captcha-trigger-btn",
+        captchaVerifyCallback: function (captchaVerifyParam) {
+          window.__captchaVerifyParam = captchaVerifyParam;
+          window.__captchaAt = Date.now();
+          return { captchaResult: true, bizResult: true };
+        },
+        onBizResultCallback: function () { window.__bizResult = true; },
+        // getInstance 是 SDK 把「构造完成的实例」交回来的时刻：它在 init / bindEvents
+        // 之后才回调（实测 init 后 300–550ms）。**只有到这时触发按钮才真正绑上点击
+        // 处理**，更早的点击会被直接丢掉（表现为点了没反应、取参一路超时，真值档
+        // 于是退化成 transport_error）。就绪标志必须在这里置位，不能像以前那样在
+        // initAliyunCaptcha 返回后同步置位。
+        getInstance: function (instance) {
+          window.__captchaInstance = instance;
+          window.__sdkReady = true;
+        },
+        slideStyle: { width: 360, height: 50 },
+        language: "cn"
+      });
+    } catch (e) { window.__sdkErr = "" + e; }
+  }
 })();
 </script>
 </body></html>`

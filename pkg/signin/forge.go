@@ -26,7 +26,8 @@ var ForgeDefaults = struct {
 // 探针（cmd/signinprobe）与库共用这一份实现，保证两边不会漂移。
 //
 // ⚠️ 结构合法不代表会被接受：伪造值提交到 captcha-verify 后，服务端很可能
-// 在人机层拒签；它的用途正是把「参数层拒绝」与「人机层拒绝」分开。
+// 让阿里云风控拒签（`captchaVerifyCode:"F014"`：没有初始化记录）；
+// 它的用途正是把「参数层拒绝」与「风控拒绝」分开。
 // 提交它可能写入真实 CheckInRecord，后果由使用者承担。
 func ForgeCaptchaParam(sample string) string {
 	var parsed struct {

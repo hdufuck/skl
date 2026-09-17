@@ -2,6 +2,9 @@ package skl
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -123,7 +126,8 @@ type SchoolUnit struct {
 // （`id`、`userId`、`classNo`、`name`、`major`、`unitCode`、`unitName`、
 // `grade`、`studyLevel`），而不是这里的 `courseCode` 系；未实测到
 // `courseId`/`courseName`/`teacherName`。另外实测值 `absentTimeCount` 是 `0.0`
-// （浮点），而这里的类型是 `int`（整数值能被 json 接受，非整数值会让整个数组解码失败）。
+// （浮点写法），而 Go 的 `encoding/json` 对 `0.0` → `int` 是**报错**（不是取整），
+// 所以这个结构体自己实现 `UnmarshalJSON` 做宽松取整（见下）。
 // 要动这几个字段之前先补一次实测。
 type CheckInCount struct {
 	AbsentCount      int     `json:"absentCount"`
@@ -141,6 +145,77 @@ type CheckInCount struct {
 	CourseNo      string `json:"courseNo"`
 	CourseType    string `json:"courseType"`
 	TeacherName   string `json:"teacherName"`
+}
+
+// UnmarshalJSON 容忍服务端把整数值写成浮点。
+//
+// 实测（`har#3` 采集的 `/checkIn/stu-course-check-in-count`）里有 `absentTimeCount: 0.0`，
+// 而 Go 的 `encoding/json` 对 `0.0` → `int` 是**报错**，会让整个数组解码失败 ——
+// 真实响应根本读不回来。这里先把计数字段收成 `json.Number` 再取整，
+// **字段类型保持 `int`**，调用方不受影响。
+// 非整数值（如 `1.5`）会被截断：服务端这些字段是次数，不应当有小数。
+func (c *CheckInCount) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		AbsentCount      json.Number `json:"absentCount"`
+		AbsentLeaveCount json.Number `json:"absentLeaveCount"`
+		AbsentTimeCount  json.Number `json:"absentTimeCount"`
+		CourseTotalTime  float64     `json:"courseTotalTime"`
+		LateCount        json.Number `json:"lateCount"`
+		LeaveCount       json.Number `json:"leaveCount"`
+		RightCount       json.Number `json:"rightCount"`
+
+		CourseCode    string `json:"courseCode"`
+		CourseGroupNo string `json:"courseGroupNo"`
+		CourseID      string `json:"courseId"`
+		CourseName    string `json:"courseName"`
+		CourseNo      string `json:"courseNo"`
+		CourseType    string `json:"courseType"`
+		TeacherName   string `json:"teacherName"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("skl: 解析考勤统计失败: %w", err)
+	}
+
+	counts := []struct {
+		src  json.Number
+		dest *int
+	}{
+		{raw.AbsentCount, &c.AbsentCount},
+		{raw.AbsentLeaveCount, &c.AbsentLeaveCount},
+		{raw.AbsentTimeCount, &c.AbsentTimeCount},
+		{raw.LateCount, &c.LateCount},
+		{raw.LeaveCount, &c.LeaveCount},
+		{raw.RightCount, &c.RightCount},
+	}
+	for _, n := range counts {
+		v, err := countFromNumber(n.src)
+		if err != nil {
+			return err
+		}
+		*n.dest = v
+	}
+	c.CourseTotalTime = raw.CourseTotalTime
+	c.CourseCode = raw.CourseCode
+	c.CourseGroupNo = raw.CourseGroupNo
+	c.CourseID = raw.CourseID
+	c.CourseName = raw.CourseName
+	c.CourseNo = raw.CourseNo
+	c.CourseType = raw.CourseType
+	c.TeacherName = raw.TeacherName
+	return nil
+}
+
+// countFromNumber 把计数字段取整；字段缺失/为空/为 null 时算 0。
+func countFromNumber(n json.Number) (int, error) {
+	s := strings.TrimSpace(n.String())
+	if s == "" || s == "null" {
+		return 0, nil
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("skl: 考勤统计字段期望数字，收到 %q", s)
+	}
+	return int(f), nil
 }
 
 // Total 返回已判定次数的总和。

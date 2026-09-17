@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -31,8 +32,9 @@ type harDoc struct {
 type harEntry struct {
 	StartedDateTime string `json:"startedDateTime"`
 	Request         struct {
-		Method string `json:"method"`
-		URL    string `json:"url"`
+		Method  string      `json:"method"`
+		URL     string      `json:"url"`
+		Headers []harHeader `json:"headers"`
 	} `json:"request"`
 	Response struct {
 		Status  int         `json:"status"`
@@ -49,6 +51,48 @@ type harHeader struct {
 	Value string `json:"value"`
 }
 
+// resolvedURL 是这条 HAR 记录里真正被请求的 URL。
+//
+// 不能直接信 `request.url`：见 authorityFromHost。
+func (e harEntry) resolvedURL() string {
+	return authorityFromHost(e.Request.URL, hostHeader(e.Request.Headers))
+}
+
+// hostHeader 取请求头里的 Host；没有就返回空串（HAR 里 Host 常被写成普通头）。
+func hostHeader(hs []harHeader) string {
+	for _, h := range hs {
+		if strings.EqualFold(h.Name, "Host") {
+			return h.Value
+		}
+	}
+	return ""
+}
+
+// authorityFromHost 用请求的 Host 头改写 URL 的 authority。
+//
+// 为什么需要：Reqable 有时会把 `request.url` 写成另一个权威——实测一条
+// captcha-verify 的 url 是 `https://sso.hdu.edu.cn/...`，而同一条请求的
+// `Host` 头是 `skl.hdu.edu.cn`（那是 Reqable 的字段伪影）。照抄 `url` 会把
+// 报告里的目标主机写错，进而误导判读，所以只信 Host 头：scheme、path、
+// query 原样保留，Host 头自带端口时端口也保留。
+//
+// host 为空、URL 解析失败/无权威、或与 URL 主机相同时，原样返回 rawURL。
+func authorityFromHost(rawURL, host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return rawURL
+	}
+	if strings.EqualFold(u.Host, host) {
+		return rawURL
+	}
+	u.Host = host
+	return u.String()
+}
+
 // ParseHARExchange 从 Reqable 上报服务器发来的 HAR 文档里，挑出手机端那次
 // `captcha-verify` 请求/响应。
 //
@@ -62,7 +106,7 @@ func ParseHARExchange(body []byte) (*Entry, error) {
 
 	var matched []harEntry
 	for _, e := range doc.Log.Entries {
-		if strings.Contains(e.Request.URL, SignInCaptchaPath) {
+		if strings.Contains(e.resolvedURL(), SignInCaptchaPath) {
 			matched = append(matched, e)
 		}
 	}
@@ -90,7 +134,7 @@ func ParseHARExchange(body []byte) (*Entry, error) {
 		Rung:      RungPhoneCaptcha,
 		Title:     "手机端官方签到（Reqable 上报）",
 		Method:    chosen.Request.Method,
-		URL:       RedactURL(chosen.Request.URL),
+		URL:       RedactURL(chosen.resolvedURL()),
 		ParamKind: ParamGenuine,
 		Status:    chosen.Response.Status,
 		Body:      strings.TrimSpace(respBody),
@@ -108,23 +152,10 @@ func ParseHARExchange(body []byte) (*Entry, error) {
 	}
 	entry.RespHeaders = RedactHeaders(headers)
 
-	hints := hintsFrom(RungCaptchaGenuine, entry.Body)
-	entry.Verdict = Classify(ClassifyInput{
-		Rung:                RungCaptchaGenuine,
-		Status:              entry.Status,
-		Body:                []byte(entry.Body),
-		CaptchaVerifyResult: hints.cvr,
-		CheckCodeDtoLen:     hints.dtoLen,
-	})
-	entry.Evidence = entry.Verdict.Evidence()
+	entry.CaptchaVerifyCode = hintsFrom(entry.Body).captchaVerifyCode
 	return entry, nil
 }
 
-// NewHookHandler 返回 Reqable「上报服务器」的接收端点。
-//
-// Reqable 每完成一个会话就 POST 一份 HAR JSON 过来；本 handler 解析出
-// captcha-verify 那条并推入 ch（推不进去就丢弃，不阻塞、不影响抓包）。
-// 无论解析成败都返回 200，因为 Reqable 不会重试。
 // decodeHookBody 按 Content-Encoding 解压上报体。
 //
 // Reqable 的上报服务器支持 gzip / brotli / zstd / none；本实现只支持 gzip 与

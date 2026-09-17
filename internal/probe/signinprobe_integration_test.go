@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,7 +24,6 @@ import (
 func TestIntegrationGenuineRungReachesServer(t *testing.T) {
 	var sent []string
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
 		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 		Captcha: func(param, _ string) (int, string, bool) {
 			if param != "" {
@@ -63,12 +63,12 @@ func TestIntegrationGenuineRungReachesServer(t *testing.T) {
 	if genuine == nil {
 		t.Fatal("报告里没有真值档记录")
 	}
-	if genuine.Verdict == VerdictTransportError {
-		t.Fatalf("真值档仍是 transport_error（演练里会显示成「-」）: %s", genuine.Err)
+	if genuine.Status != 401 {
+		t.Fatalf("真值档应拿到 401 签到码不存在：status=%d body=%s err=%s",
+			genuine.Status, genuine.Body, genuine.Err)
 	}
-	if genuine.Status != 401 || genuine.Verdict != VerdictCodeRejected {
-		t.Fatalf("真值档应拿到 401 签到码不存在：status=%d verdict=%s body=%s",
-			genuine.Status, genuine.Verdict, genuine.Body)
+	if !strings.Contains(genuine.Body, "签到码") {
+		t.Fatalf("真值档响应体应含「签到码」：%s", genuine.Body)
 	}
 	if rep.GenuineUnproven() {
 		t.Fatal("拿到了 HTTP 状态，就不应再报「真值档未验证」")

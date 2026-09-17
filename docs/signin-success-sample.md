@@ -84,7 +84,7 @@
 | 形态 | 条号 / 时刻 | 响应体 | 判读 |
 | --- | --- | --- | --- |
 | `200` + 成功 | 101 / `t+112.954s` | `{"captchaVerifyResult":true,"captchaVerifyCode":"T001","checkCodeDto":{…}}` | 成功 |
-| `200` + **人机被拒** | 98 / `t+110.577s` | `{"captchaVerifyResult":false,"captchaVerifyCode":"F001"}` | **人机层单独拒签**；无 `checkCodeDto` |
+| `200` + **人机被拒** | 98 / `t+110.577s` | `{"captchaVerifyResult":false,"captchaVerifyCode":"F001"}` | **阿里云风控不通过**（官方措辞：「疑似攻击请求，风险策略不通过」）；无 `checkCodeDto` |
 | `401` + 业务失败 | 1 / `t+0.090s` | `{"code":0,"msg":"签到码不存在，不要玩我"}` | 签到码校验**先于**人机校验 |
 | `414` + 网关 | 6 / `t+63.828s`；10 / `t+99.380s` | `URI too long\n`（`text/plain`，13 字节） | 请求行超长，被**网关**挡下，未到应用 |
 
@@ -265,7 +265,7 @@ t+115.206s  第 111 条 GET /api/checkIn/stu-course-check-in-count?courseId=<已
 | `docs/api.md` §1.3 | 「时间戳：毫秒（`recordDate`、`expiresIn`、`t`）」 | `recordDate`/`expiresDate` 是 **ISO-8601 串**（`recordDate` 时刻恒为零点）；`expiresIn` 是**时长 ms**；只有 `t` 是毫秒 epoch | `docs/api.md` §1.3 |
 | `docs/api.md` §1.2 响应形态表 | 缺「`200` + JSON 也可能是**人机拒签**」与网关 `414` | 增两行（`F001` / `URI too long`） | `docs/api.md` §1.2 |
 | `docs/signin-probe.md` §1.5 | 「窗口长度：很可能 ~300s ✅」「`expiresIn` 实际传的是 `Date.now()`」 | **实测可只有 20 s**（`expiresIn=20000`）；默认预算 31s 可能超窗，需收紧 | `docs/signin-probe.md` §1.5、§2.1 |
-| `docs/signin-probe.md` §0 / §3 判读表 | 无「网关拒请求行」这一类 | 新增判读 `uri_too_long`（强指网关，不是服务端策略） | `probe.go`；两份文档的判读表 |
+| `docs/signin-probe.md` §0 / §3 人工判读参考 | 无「网关拒请求行」这一类 | 新增判读 `uri_too_long`（强指网关，不是服务端策略） | `probe.go`；两份文档的观测表 |
 | `docs/signin-probe.md` §1.2 | 引 `index-new-COcfVClM.js`，无 `getInstance`/`slideStyle` | 已换为 `har#3` 里的 `index-new-dX4pM4CL.js` 原文（多了两个键与 `catch` 分支） | `docs/signin-probe.md` §1.2 |
 | `docs/signin-probe.md` §2 阶梯 | 真值档只打一枪 | 失败自动换新参数重取（默认 3 次，`--genuine-attempts`），逐次落 `attempts` | `runner.go`、`report.go`、`main.go` |
 | `docs/signin-probe.md` §3 读回 | 只看 `/check-in-student-detail/my` | 补上「UI 实际读 `/checkIn/stu-course-check-in-count`」这条局限与人工核对方法 | `docs/signin-probe.md` §3 |

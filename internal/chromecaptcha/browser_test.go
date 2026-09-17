@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -68,19 +67,7 @@ func testChromePath(t *testing.T) string {
 // 这里刻意在 New 与 Param 之间留一段间隔，模拟「T0 前预热、T0 后才取参」的真实
 // 时序；并用桩 SDK 的绑定延迟断言 New 确实等到了实例。
 func TestNewKeepsBrowserAliveUntilParam(t *testing.T) {
-	src, err := New(context.Background(), Options{
-		ChromePath:     testChromePath(t),
-		Headless:       true,
-		UserDataDir:    filepath.Join(t.TempDir(), "chrome-profile"),
-		StartupTimeout: 60 * time.Second,
-		Logf:           t.Logf,
-		Fulfill: func(rawURL string) (string, string, bool) {
-			if strings.Contains(rawURL, "AliyunCaptcha") {
-				return "application/javascript", stubSDK, true
-			}
-			return "", "", false
-		},
-	})
+	src, err := New(context.Background(), stubOptions(t, Options{}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -116,19 +103,15 @@ func TestNewStartupBudgetStillApplies(t *testing.T) {
 	// 桩 SDK 永久占住渲染线程：页面永远到不了「SDK 已就绪」，waitReady 会一直
 	// 阻塞在自己的 Evaluate 上。只有看门狗能把它救出来。
 	start := time.Now()
-	src, err := New(context.Background(), Options{
-		ChromePath:     testChromePath(t),
-		Headless:       true,
-		UserDataDir:    filepath.Join(t.TempDir(), "chrome-profile"),
+	src, err := New(context.Background(), stubOptions(t, Options{
 		StartupTimeout: 2 * time.Second,
-		Logf:           t.Logf,
 		Fulfill: func(rawURL string) (string, string, bool) {
 			if strings.Contains(rawURL, "AliyunCaptcha") {
 				return "application/javascript", "for(;;){}", true
 			}
 			return "", "", false
 		},
-	})
+	}))
 	if err == nil {
 		_ = src.Close()
 		t.Fatal("页面卡死时 New 应当报错")

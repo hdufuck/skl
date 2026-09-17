@@ -169,3 +169,14 @@ func WithCaptchaProvider(p CaptchaProvider) Option {
 		}
 	}
 }
+
+// WithUserAgent 覆盖所有请求上报的 User-Agent（默认是项目自报名）。
+//
+// 用途：签到那条请求承载的 `captchaVerifyParam` 由浏览器铸出，想让 HTTP 客户端
+// 与那个浏览器自称一致时用它（例如 `WithUserAgent(source.UserAgent())`）。
+// 空串恢复默认值；每个请求仍可用 Request.Header 里的 User-Agent 单独覆盖。
+func WithUserAgent(ua string) Option {
+	return func(c *Client) {
+		c.SetUserAgent(ua)
+	}
+}

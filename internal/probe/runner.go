@@ -31,9 +31,6 @@ type CaptchaParamSource interface {
 
 // Prompter 是交互接口，便于测试时替换成脚本化实现。
 type Prompter interface {
-	// Gate 在检测到写入后询问是否继续；返回 true 表示继续跑后续档位。
-	// 实现应在 timeout 内未收到输入时返回默认动作（false = 停）。
-	Gate(ctx context.Context, entry Entry, timeout time.Duration) (bool, error)
 	// Notify 输出一行提示。
 	Notify(format string, args ...any)
 }
@@ -55,23 +52,30 @@ type Config struct {
 	SkipGenuine bool
 
 	Prompter Prompter
-	Logf     func(format string, args ...any)
-	Now      func() time.Time
+	// Now 覆盖时间源（测试用）；为 nil 时用 time.Now。
+	Now func() time.Time
 
-	// ReadBack 读取今日签到明细快照；为 nil 时报错。
-	ReadBack func(ctx context.Context) (Snapshot, error)
-	// Baseline 是 T0 前的读回基线；为 nil 时在 Run 开始时现读一次。
-	Baseline *Snapshot
+	// ReadBack 读取**当前（今日）的考勤记录原始数组**。每档请求之后调用一次，
+	// 结果原样记进报告，不做任何判读。为 nil 时报错。
+	ReadBack func(ctx context.Context) ([]json.RawMessage, error)
+	// Baseline 是 T0 前的考勤记录基线；为 nil 时在 Run 开始时现读一次。
+	Baseline []json.RawMessage
 
 	// Hook 是手机端 Reqable 上报服务器送来的条目（可为 nil）。
 	Hook <-chan Entry
 
+	// Ladder 覆盖本次运行的开火顺序（可选）；为空表示用包级默认 Ladder。
+	//
+	// 为什么允许覆盖：前置三档会在真值档之前几秒，对同一个 userid+scene
+	// 打出失败的人机提交，这是真值档 F001 归属的混淆项；而真实窗口昂贵且
+	// 一次性，所以操作者必须能把真值档单独（或排在最前）跑一次。
+	// 用 ParseLadder 从命令行规格构造。
+	Ladder []RungID
+
 	// 以下均为可选覆盖，0 表示用默认值。
-	LadderDeadline     time.Duration
-	CaptchaDeadline    time.Duration
-	GateTimeout        time.Duration
-	HookWait           time.Duration
-	ContinueAfterWrite bool
+	LadderDeadline  time.Duration
+	CaptchaDeadline time.Duration
+	HookWait        time.Duration
 
 	// GenuineAttempts 是真值档最多跑几次（每次重取一个新 captchaVerifyParam）。
 	// 0 表示默认值（3）：`har#3` 抓包里三次提交才成功一次。
@@ -81,7 +85,6 @@ type Config struct {
 const (
 	defaultLadderDeadline  = 8 * time.Second
 	defaultCaptchaDeadline = 23 * time.Second
-	defaultGateTimeout     = 5 * time.Second
 	defaultHookWait        = 10 * time.Second
 	// defaultGenuineAttempts 默认让真值档最多跑 3 次：`har#3` 抓包里
 	// 第 1、2 次都死在网关（414），第 3 次才真正到应用并成功。
@@ -100,13 +103,6 @@ func (c Config) captchaDeadline() time.Duration {
 		return c.CaptchaDeadline
 	}
 	return defaultCaptchaDeadline
-}
-
-func (c Config) gateTimeout() time.Duration {
-	if c.GateTimeout > 0 {
-		return c.GateTimeout
-	}
-	return defaultGateTimeout
 }
 
 func (c Config) hookWait() time.Duration {
@@ -132,17 +128,18 @@ func (c Config) rungAttempts(rung RungID) int {
 	return defaultGenuineAttempts
 }
 
+func (c Config) ladder() []RungID {
+	if len(c.Ladder) == 0 {
+		return Ladder
+	}
+	return c.Ladder
+}
+
 func (c Config) now() time.Time {
 	if c.Now != nil {
 		return c.Now()
 	}
 	return time.Now()
-}
-
-func (c Config) logf(format string, args ...any) {
-	if c.Logf != nil {
-		c.Logf(format, args...)
-	}
 }
 
 // Run 按阶梯顺序执行探针，返回完整报告。
@@ -171,23 +168,20 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 		Lon:       cfg.Coord.Lon,
 	}
 
-	baseline := Snapshot{}
-	if cfg.Baseline != nil {
-		baseline = *cfg.Baseline
-	} else {
+	baseline := cfg.Baseline
+	if baseline == nil {
 		s, err := cfg.ReadBack(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("probe: 读取基线失败: %w", err)
 		}
 		baseline = s
 	}
-	rep.BaselineCount = baseline.Count
-	prev := baseline
+	rep.BaselineCount = len(baseline)
 
 	ladderDeadline := start.Add(cfg.ladderDeadline())
 	captchaDeadline := start.Add(cfg.captchaDeadline())
 
-	for _, rung := range Ladder {
+	for _, rung := range cfg.ladder() {
 		budget := cfg.ladderDeadline()
 		deadline := ladderDeadline
 		if rung == RungCaptchaGenuine {
@@ -205,27 +199,9 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 		// 给每档一个真实的 ctx deadline，而不是只在起跑前比较时间：
 		// 否则一个挂起的请求会直接击穿预算，吃掉留给手机的窗口。
 		rungCtx, cancelRung := context.WithDeadline(ctx, deadline)
-		entry := cfg.runRung(rungCtx, rung, prev)
+		entry := cfg.runRung(rungCtx, rung)
 		cancelRung()
 		rep.Entries = append(rep.Entries, entry)
-		if entry.Wrote {
-			prev = Snapshot{Count: entry.After, Keys: append(append([]string{}, prev.Keys...), entry.NewKeys...)}
-			cfg.logf("⚠ %s 写入了 %d 条新记录（%s）", rung, len(entry.NewKeys), entry.NewKeys)
-			if !cfg.ContinueAfterWrite {
-				cont := false
-				if cfg.Prompter != nil {
-					ok, err := cfg.Prompter.Gate(ctx, entry, cfg.gateTimeout())
-					if err != nil {
-						return rep, err
-					}
-					cont = ok
-				}
-				if !cont {
-					rep.StoppedAt = rung
-					break
-				}
-			}
-		}
 	}
 
 	if cfg.Hook != nil {
@@ -271,13 +247,12 @@ func phoneCodeNote(phone *Entry, want string) string {
 }
 
 // runRung 执行一档探针并组装记录。
-func (cfg Config) runRung(ctx context.Context, rung RungID, prev Snapshot) Entry {
+func (cfg Config) runRung(ctx context.Context, rung RungID) Entry {
 	entry := Entry{
 		Rung:      rung,
 		Title:     rung.Title(),
 		At:        cfg.now(),
 		ParamKind: rung.ParamKind(),
-		Before:    prev.Count,
 	}
 
 	began := cfg.now()
@@ -305,7 +280,7 @@ func (cfg Config) runRung(ctx context.Context, rung RungID, prev Snapshot) Entry
 		if cur != nil {
 			body = strings.TrimSpace(string(cur.Body))
 		}
-		curHints := hintsFrom(rung, body)
+		curHints := hintsFrom(body)
 
 		retry := retryWithFreshParamReason(rung, cur, curHints)
 		entry.Attempts = append(entry.Attempts, newAttempt(cur, body, retry))
@@ -348,28 +323,14 @@ func (cfg Config) runRung(ctx context.Context, rung RungID, prev Snapshot) Entry
 	}
 	entry.CaptchaVerifyCode = hints.captchaVerifyCode
 
-	after, rbErr := cfg.ReadBack(ctx)
+	// 请求之后把考勤记录原样记下来（不做判读，由人去看）。
+	records, rbErr := cfg.ReadBack(ctx)
 	if rbErr != nil {
-		entry.Note = appendNote(entry.Note, "读回失败: "+rbErr.Error())
+		entry.ReadBackErr = rbErr.Error()
 	} else {
-		entry.After = after.Count
-		entry.NewKeys = after.NewKeys(prev)
-		entry.Wrote = len(entry.NewKeys) > 0
+		entry.AfterRequest = records
 	}
 
-	entry.Verdict = Classify(ClassifyInput{
-		Rung:                rung,
-		Status:              entry.Status,
-		Body:                []byte(entry.Body),
-		Err:                 entry.Err,
-		Wrote:               entry.Wrote,
-		AnalyzeCode:         hints.analyzeCode,
-		HasAnalyzeCode:      hints.hasAnalyzeCode,
-		CaptchaVerifyResult: hints.cvr,
-		CaptchaVerifyCode:   hints.captchaVerifyCode,
-		CheckCodeDtoLen:     hints.dtoLen,
-	})
-	entry.Evidence = entry.Verdict.Evidence()
 	return entry
 }
 
@@ -405,23 +366,20 @@ func retryWithFreshParamReason(rung RungID, ex *Exchange, hints hintSet) string 
 	case ex.Status == http.StatusRequestEntityTooLarge || ex.Status == http.StatusRequestURITooLong:
 		return fmt.Sprintf("HTTP %d：请求行长 %d 字节，被网关拒绝（未达应用）⟹ 换一个新参数重取",
 			ex.Status, len(ex.URL))
-	case ex.Status == http.StatusOK && isCaptchaRejected(hints):
+	case ex.Status == http.StatusOK && captchaReturnedFalse(hints):
 		return "人机判定为 false ⟹ 换一个新参数重取（官方 SDK 在 F001 后也是这样 reInitCaptcha 的）"
 	}
 	return ""
 }
 
-// isCaptchaRejected 报告这次响应是否明确指向人机层失败。
+// captchaReturnedFalse 报告这次响应是否明确指向人机层失败。
 //
-// 直接复用判读层，避免「什么算人机失败」在重试决策与结论两处各写一遍。
-func isCaptchaRejected(hints hintSet) bool {
-	return Classify(ClassifyInput{
-		Rung:                RungCaptchaGenuine,
-		Status:              http.StatusOK,
-		Body:                []byte("{\"x\":1}"),
-		CaptchaVerifyResult: hints.cvr,
-		CaptchaVerifyCode:   hints.captchaVerifyCode,
-	}) == VerdictCaptchaRejected
+// 只服务真值档的重取决策，不作为成败判据。
+func captchaReturnedFalse(hs hintSet) bool {
+	if hs.cvr != nil {
+		return !*hs.cvr
+	}
+	return strings.EqualFold(strings.TrimSpace(hs.captchaVerifyCode), "F001")
 }
 
 // newAttempt 把一次往返汇总成报告里的一条记录。
@@ -442,13 +400,6 @@ func isRetryableEmptyBody(ex *Exchange) bool {
 // execute 调用库的封装路径执行一档探针。
 func (cfg Config) execute(ctx context.Context, rung RungID) error {
 	switch rung {
-	case RungAnalyzeA0:
-		_, err := cfg.Client.SignInLegacyAnalyze(ctx, skl.AnalyzeRequest{
-			Code:   cfg.Code,
-			UserID: cfg.UserID,
-		})
-		return err
-
 	case RungLegacyCheckIn:
 		_, err := cfg.Client.SignInLegacy(ctx, skl.SignInRequest{
 			Code:      cfg.Code,
@@ -510,37 +461,20 @@ func (cfg Config) execute(ctx context.Context, rung RungID) error {
 }
 
 type hintSet struct {
-	analyzeCode       int
-	hasAnalyzeCode    bool
 	cvr               *bool
 	captchaVerifyCode string
-	dtoLen            int
 }
 
-// hintsFrom 从响应体里提取判读所需的字面量。
-func hintsFrom(rung RungID, body string) hintSet {
+// hintsFrom 从响应体里提取 captchaVerifyResult / captchaVerifyCode。
+//
+// 只用于真值档的重取判断与报告留档，不用来判读成败。
+func hintsFrom(body string) hintSet {
 	var hs hintSet
-	payload := []byte(body)
-	if rung == RungAnalyzeA0 {
-		payload = unwrapJSONP(payload)
-		var env struct {
-			Result struct {
-				Code int `json:"code"`
-			} `json:"result"`
-		}
-		if err := json.Unmarshal(payload, &env); err == nil {
-			hs.analyzeCode = env.Result.Code
-			hs.hasAnalyzeCode = true
-		}
-		return hs
-	}
-
 	var env struct {
 		CVR  json.RawMessage `json:"captchaVerifyResult"`
 		Code string          `json:"captchaVerifyCode"`
-		DTO  json.RawMessage `json:"checkCodeDto"`
 	}
-	if err := json.Unmarshal(payload, &env); err != nil {
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
 		return hs
 	}
 	hs.captchaVerifyCode = env.Code
@@ -550,27 +484,7 @@ func hintsFrom(rung RungID, body string) hintSet {
 			hs.cvr = &b
 		}
 	}
-	if len(env.DTO) > 0 && string(env.DTO) != "null" {
-		hs.dtoLen = len(env.DTO)
-	}
 	return hs
-}
-
-// unwrapJSONP 去掉 `callback({...})` 外壳；已是纯 JSON 时原样返回。
-func unwrapJSONP(body []byte) []byte {
-	trimmed := strings.TrimSpace(string(body))
-	if trimmed == "" {
-		return nil
-	}
-	if trimmed[0] == '{' || trimmed[0] == '[' {
-		return []byte(trimmed)
-	}
-	if _, after, ok := strings.Cut(trimmed, "("); ok {
-		if end := strings.LastIndexByte(after, ')'); end >= 0 {
-			return []byte(strings.TrimSpace(after[:end]))
-		}
-	}
-	return []byte(trimmed)
 }
 
 func formatCoord(v float64) string {
@@ -584,14 +498,13 @@ func appendNote(existing, add string) string {
 	return existing + "; " + add
 }
 
-// ReadBackToday 用今日签到明细构造读回函数。
-func ReadBackToday(c *skl.Client) func(ctx context.Context) (Snapshot, error) {
-	return func(ctx context.Context) (Snapshot, error) {
+// ReadBackToday 返回一个「读取今日考勤记录原始数组」的函数。
+//
+// 元素形态未实测（HAR 里恒为 `[]`），因此**不做任何解析**，原样返回，
+// 由报告记录、由人判读。
+func ReadBackToday(c *skl.Client) func(ctx context.Context) ([]json.RawMessage, error) {
+	return func(ctx context.Context) ([]json.RawMessage, error) {
 		now := time.Now()
-		raw, err := c.MyCheckInDetails(ctx, now, now)
-		if err != nil {
-			return Snapshot{}, err
-		}
-		return SnapshotFromRaw(raw), nil
+		return c.MyCheckInDetails(ctx, now, now)
 	}
 }

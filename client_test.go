@@ -184,8 +184,9 @@ func newMockSkl(t *testing.T) *mockSkl {
 		m.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"token":  r.Header.Get(HeaderAuthToken),
-			"ticket": r.Header.Get(HeaderTicket),
+			"token":     r.Header.Get(HeaderAuthToken),
+			"ticket":    r.Header.Get(HeaderTicket),
+			"userAgent": r.Header.Get("User-Agent"),
 		})
 	})
 
@@ -452,6 +453,69 @@ func TestDoSendsAuthTokenOnlyWhenPresent(t *testing.T) {
 	}
 	if second["token"] != "abc" {
 		t.Fatalf("X-Auth-Token = %q, want abc", second["token"])
+	}
+}
+
+func TestUserAgentDefaultsAndOverrides(t *testing.T) {
+	t.Parallel()
+
+	const browserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+
+	echoUA := func(t *testing.T, c *Client, label string) string {
+		t.Helper()
+		resp, err := c.Get(t.Context(), "/api/echo", nil)
+		if err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+		var got map[string]string
+		if err := resp.JSON(&got); err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+		return got["userAgent"]
+	}
+
+	m := newMockSkl(t)
+
+	// 默认是项目自报名。
+	c := newMockClient(t, m)
+	if got := echoUA(t, c, "默认"); got != defaultUserAgent {
+		t.Fatalf("默认 User-Agent = %q, want %q", got, defaultUserAgent)
+	}
+	if c.UserAgent() != defaultUserAgent {
+		t.Fatalf("UserAgent() = %q, want %q", c.UserAgent(), defaultUserAgent)
+	}
+
+	// WithUserAgent 生效。
+	withUA := newMockClient(t, m, WithUserAgent(browserUA))
+	if got := echoUA(t, withUA, "WithUserAgent"); got != browserUA {
+		t.Fatalf("WithUserAgent 之后 User-Agent = %q, want %q", got, browserUA)
+	}
+
+	// SetUserAgent 可以在运行中换（例如浏览器预热完才知道自称），空串恢复默认。
+	c.SetUserAgent(browserUA)
+	if got := echoUA(t, c, "SetUserAgent"); got != browserUA {
+		t.Fatalf("SetUserAgent 之后 User-Agent = %q, want %q", got, browserUA)
+	}
+	c.SetUserAgent("")
+	if got := echoUA(t, c, "恢复默认"); got != defaultUserAgent {
+		t.Fatalf("SetUserAgent(\"\") 之后 User-Agent = %q, want %q", got, defaultUserAgent)
+	}
+
+	// 逐请求覆盖仍然优先（Request.Header 里的 User-Agent）。
+	resp, err := withUA.Do(t.Context(), &Request{
+		Method: http.MethodGet,
+		Path:   "/api/echo",
+		Header: http.Header{"User-Agent": {"per-request"}},
+	})
+	if err != nil {
+		t.Fatalf("逐请求覆盖: %v", err)
+	}
+	var got map[string]string
+	if err := resp.JSON(&got); err != nil {
+		t.Fatalf("逐请求覆盖: %v", err)
+	}
+	if got["userAgent"] != "per-request" {
+		t.Fatalf("逐请求覆盖失效: %q", got["userAgent"])
 	}
 }
 

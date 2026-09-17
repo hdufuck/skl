@@ -236,7 +236,7 @@ for _, m := range signin.Methods() {
 | 形态 | 含义 |
 | --- | --- |
 | `200` + `captchaVerifyResult:true` + 非空 `checkCodeDto` | 成功（`captchaVerifyCode:"T001"`） |
-| `200` + `captchaVerifyResult:false` | **人机层单独拒签**（`captchaVerifyCode:"F001"`） |
+| `200` + `captchaVerifyResult:false` | **阿里云风控不通过**（`captchaVerifyCode:"F001"` = 官方措辞「疑似攻击请求，风险策略不通过」；换一份新参数就可能过） |
 | `401` + `{"code":0,"msg":"签到码不存在，不要玩我"}` | 签到码校验**先于**人机校验 |
 | `414` + `text/plain` `URI too long` | **网关**拒了超长请求行（`captchaVerifyParam.data` 会膨胀到 25 KB 量级） |
 
@@ -259,7 +259,9 @@ for _, m := range signin.Methods() {
 
 `har#3` 那次浏览器签到补上了一半答案：**有效签到码 + 人机不通过**得到的是
 `200 {"captchaVerifyResult":false,"captchaVerifyCode":"F001"}`（**不是** 401）——
-说明人机层确实会单独拦一次请求。但「有效码 + 完全不给参数」仍未被采样，
+说明**风控**会在签到码之后单独拦一次请求（`F001` 的官方定义是「疑似攻击请求，
+风险策略不通过」，错误码表见 [`docs/signin-probe.md`](docs/signin-probe.md) §0.1）。
+但「有效码 + 完全不给参数」仍未被采样，
 所以「是否**强制**」依然只能靠探针在真实窗口里回答。
 
 同理，遗留接口 `checkIn/code-check-in` 与 `ali-nvc/check-code-analyze`
@@ -272,18 +274,21 @@ for _, m := range signin.Methods() {
 
 | 档 | 内容 |
 | --- | --- |
-| 1 | `check-code-analyze`（`a=0`，无人机凭证、无定位） |
-| 2 | `code-check-in`（无人机凭证、带定位） |
-| 3 | 有效码 + **缺失** `captchaVerifyParam`（直接回答「是否强制」） |
-| 4 | 有效码 + **结构合法但伪造**的凭证（把参数层与人机层分开） |
-| 5 | 有效码 + **官方 SDK 真值** → 库的 `SignIn`（验证库的封装路径；失败自动换新参数最多 3 次） |
+| 1 | `code-check-in`（无人机凭证、带定位） |
+| 2 | 有效码 + **缺失** `captchaVerifyParam`（直接回答「是否强制」） |
+| 3 | 有效码 + **结构合法但伪造**的凭证（把参数层与人机层分开） |
+| 4 | 有效码 + **官方 SDK 真值** → 库的 `SignIn`（验证库的封装路径；失败自动换新参数最多 3 次） |
 
 预置清单、相位预算（默认 8s + 23s，可用 `--ladder-deadline` /
-`--captcha-deadline` 收紧到 20s 窗口以内）、写入闸门、读回判读表、脱敏规则、
+`--captcha-deadline` 收紧到 20s 窗口以内）、每档请求后的考勤记录读回、脱敏规则、
 以及手机端（钉钉 + Reqable 上报服务器）要做的每一步，都在那份手册里。
+真窗口建议用 `--ladder genuine` 只跑真值档：前置三档会向同一个 `userid`+`scene`
+打进去几次风控不通过的提交，紧接在真值档之前，是「真值档为什么 F001」的混淆因子。
 这套实验的约束与取舍——为什么允许从本机发探针、为什么本机失败只作弱证据、
 为什么继续排除模拟器——见
-[`docs/adr/0002-本机探针与浏览器取参的取舍.md`](docs/adr/0002-本机探针与浏览器取参的取舍.md)。
+[`docs/adr/0002-本机探针与浏览器取参的取舍.md`](docs/adr/0002-本机探针与浏览器取参的取舍.md)；
+浏览器应该自称成什么设备（默认：一台自洽的桌面 Chrome，不冒充手机）见
+[`docs/adr/0003-浏览器自称与真实平台自洽.md`](docs/adr/0003-浏览器自称与真实平台自洽.md)。
 
 ## 未覆盖的鉴权路径：钉钉免登
 
@@ -436,12 +441,16 @@ CAS 回调与 token 下发，因此**整条登录链是可以离线测试的**�
 
 判定「人机验证是否强制」并验证库的签到封装路径是一次性的现场实验，
 **不在测试套件里**：按 [`docs/signin-probe.md`](docs/signin-probe.md) 执行——
-预置清单、30 秒相位预算、探针顺序、读回判读表、手机端操作与脱敏规则都写在那里，
+预置清单、30 秒相位预算、探针顺序、每档请求后的考勤记录读回、手机端操作与脱敏规则都写在那里，
 不要临场发挥。探针工具是 [`cmd/signinprobe`](cmd/signinprobe/main.go)：
 
 ```bash
 export HDU_USER=2427xxxx HDU_PASS=...
-go run ./cmd/signinprobe            # 默认 headless、Reqable hook :8080、30s 预算
+go run ./cmd/signinprobe                          # 默认：headless=new + 桌面 Chrome 自称、全部四档
+# 真窗口推荐（只跑真值档，避免前置三档污染 F001 归因）：
+#   go run ./cmd/signinprobe --ladder genuine
+# 其它开关：--headed  --mobile  --ua '<UA>'  --client-ua browser  --no-browser
+#          --ladder all|genuine|junk|<档位ID列表>  --profile <目录>
 ```
 
 > ⚠️ **不要把真实数据写进代码或文档。** 本文库会公开，而抓包/真机调试很容易

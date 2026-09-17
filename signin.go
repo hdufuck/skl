@@ -41,9 +41,12 @@ type SignInRequest struct {
 //
 // 同一个接口还有另外两种结局，都不是 `401`：
 //
-//	200 {"captchaVerifyResult":false,"captchaVerifyCode":"F001"}  人机层单独拒签
+//	200 {"captchaVerifyResult":false,"captchaVerifyCode":"F001"}  阿里云风控不通过
 //	414 text/plain "URI too long"                                   网关拒了超长请求行
 //
+// `F001` 是阿里云验证码的码，官方定义是「疑似攻击请求，风险策略不通过」——
+// 它指向**风控评分**，不是「人机验证层单独拒签」；换一份新 `captchaVerifyParam`
+// 就可能变成 `T001`（错误码表见 docs/signin-probe.md §0.1）。
 // 因此**不能用状态码判断成败**，用 [SignInResult.OK]。字段值保持 RawMessage /
 // 原生类型透出，不做结构性重命名，以保留服务端原始形状。
 //
@@ -51,7 +54,7 @@ type SignInRequest struct {
 type SignInResult struct {
 	// CaptchaVerifyResult 是服务端对本次人机凭证的判定，**严格 `true`** 才算过。
 	CaptchaVerifyResult json.RawMessage `json:"captchaVerifyResult"`
-	// CaptchaVerifyCode 是它的文字版：成功 `T001`，人机失败 `F001`。
+	// CaptchaVerifyCode 是它的文字版：成功 `T001`，风控不通过 `F001`。
 	// 该字段在前端产物里不存在（服务端专有），`har#3` 首次观察到。
 	CaptchaVerifyCode string `json:"captchaVerifyCode"`
 	// CheckCodeDto 是成功时的考勤记录详情；失败时整个键不存在（nil）。

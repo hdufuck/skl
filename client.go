@@ -46,7 +46,12 @@ const (
 	// query 里、body 为空，但**仍然**带这个头（`har#3` 抓包第 101 条）。
 	ContentTypeFormURLEncoded = "application/x-www-form-urlencoded"
 
-	userAgent = "hdufuck/skl (+https://github.com/hdufuck/skl)"
+	// defaultUserAgent 是本包默认上报的 User-Agent：项目自报名。
+	//
+	// 它也可以用 WithUserAgent / SetUserAgent 换掉：签到那条请求
+	// （`POST /api/ali-nvc/captcha-verify`）承载的 captchaVerifyParam 是浏览器里
+	// 铸出来的，想让它与「铸造参数的浏览器」看起来是同一个客户端时就改它。
+	defaultUserAgent = "hdufuck/skl (+https://github.com/hdufuck/skl)"
 
 	// maxResponseBytes 限制单次响应体大小，避免异常响应打爆内存。
 	maxResponseBytes = 8 << 20
@@ -129,9 +134,10 @@ type Client struct {
 	// loginMu 串行化登录流程，避免并发 401 时打出一串重复登录。
 	loginMu sync.Mutex
 
-	mu    sync.RWMutex
-	token string
-	user  *UserInfo
+	mu        sync.RWMutex
+	token     string
+	user      *UserInfo
+	userAgent string
 }
 
 // NewClient 创建一个 Client。
@@ -213,6 +219,28 @@ func (c *Client) SetToken(token string) {
 	if cb != nil && token != "" {
 		cb(token)
 	}
+}
+
+// SetUserAgent 换掉后续请求上报的 User-Agent（空串恢复默认的项目自报名）。
+//
+// 用途：签到（`captcha-verify`）那条请求要拿浏览器铸出来的 captchaVerifyParam
+// 去提交，而「铸造参数的浏览器」与「提交参数的客户端」自称不一致时，风控侧能否看见
+// 这个差异是未知的 —— 想对齐时用它，例如
+// `c.SetUserAgent(captchaSource.UserAgent())`。
+func (c *Client) SetUserAgent(ua string) {
+	c.mu.Lock()
+	c.userAgent = strings.TrimSpace(ua)
+	c.mu.Unlock()
+}
+
+// UserAgent 返回当前上报的 User-Agent（未覆盖时是默认的项目自报名）。
+func (c *Client) UserAgent() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.userAgent == "" {
+		return defaultUserAgent
+	}
+	return c.userAgent
 }
 
 // HasCredentials 报告是否配置了账号密码。
@@ -328,7 +356,7 @@ func (c *Client) execute(ctx context.Context, method string, req *Request) (*Res
 		hreq.Header.Set("Accept", "application/json, text/plain, */*")
 	}
 	if hreq.Header.Get("User-Agent") == "" {
-		hreq.Header.Set("User-Agent", userAgent)
+		hreq.Header.Set("User-Agent", c.UserAgent())
 	}
 	if hreq.Header.Get("Referer") == "" {
 		hreq.Header.Set("Referer", c.baseURL+"/"+c.index)

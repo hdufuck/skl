@@ -16,7 +16,7 @@ func harBody(entries string) []byte {
 
 func harEntryJSON(method, url string, status int, contentType, respText string) string {
 	doc := map[string]any{
-		"startedDateTime": "2026-09-15T10:00:00+08:00",
+		"startedDateTime": "2006-01-02T10:00:00+08:00",
 		"request": map[string]any{
 			"method": method,
 			"url":    url,
@@ -55,8 +55,8 @@ func TestParseHARExchangePicksSuccessful(t *testing.T) {
 	if entry.Status != 200 {
 		t.Fatalf("应优先挑 200 的那条，实际 %d", entry.Status)
 	}
-	if entry.Verdict != VerdictSuccess {
-		t.Fatalf("判读 = %s, want success", entry.Verdict)
+	if !strings.Contains(entry.Body, `"captchaVerifyResult":true`) {
+		t.Fatalf("未保留手机端成功响应体: %s", entry.Body)
 	}
 	if entry.RespHeaders["Content-Type"] == "" {
 		t.Fatalf("响应头未提取: %v", entry.RespHeaders)
@@ -69,6 +69,54 @@ func TestParseHARExchangePicksSuccessful(t *testing.T) {
 	}
 	if !entry.FromPhone {
 		t.Fatal("应标记来自手机")
+	}
+}
+
+// Reqable 有时把 `request.url` 写成另一个权威（实测 sso.hdu.edu.cn），而真正的
+// 目标在 `Host` 头里。报告必须记 Host 头那个，否则目标主机是错的。
+func TestParseHARExchangeUsesHostHeader(t *testing.T) {
+	entryJSON := `{"startedDateTime":"2006-01-02T10:00:00+08:00",
+		"request":{"method":"POST","url":"https://sso.hdu.edu.cn/api/ali-nvc/captcha-verify?code=1234&userid=24270001&token=secret",
+			"headers":[{"name":"content-type","value":"application/x-www-form-urlencoded"},{"name":"Host","value":"skl.hdu.edu.cn"}]},
+		"response":{"status":200,"headers":[],"content":{"text":"{\"captchaVerifyResult\":true}"}}}`
+
+	entry, err := ParseHARExchange(harBody(entryJSON))
+	if err != nil {
+		t.Fatalf("ParseHARExchange: %v", err)
+	}
+	if !strings.HasPrefix(entry.URL, "https://skl.hdu.edu.cn/api/ali-nvc/captcha-verify?") {
+		t.Fatalf("URL 的权威应取 Host 头，实际 %s", entry.URL)
+	}
+	// 改写权威不能动 scheme/path/query。
+	for _, want := range []string{"code=1234", "userid=24270001"} {
+		if !strings.Contains(entry.URL, want) {
+			t.Fatalf("URL 丢了 %s: %s", want, entry.URL)
+		}
+	}
+	// 改写之后仍要走脱敏。
+	if !strings.Contains(entry.URL, "token=<redacted>") || strings.Contains(entry.URL, "secret") {
+		t.Fatalf("URL 未脱敏: %s", entry.URL)
+	}
+}
+
+func TestAuthorityFromHost(t *testing.T) {
+	tests := []struct {
+		name, raw, host, want string
+	}{
+		{"Host 不同则改写", "https://sso.hdu.edu.cn/api/x?a=1", "skl.hdu.edu.cn", "https://skl.hdu.edu.cn/api/x?a=1"},
+		{"Host 带端口则保留端口", "https://sso.hdu.edu.cn/api/x", "skl.hdu.edu.cn:8443", "https://skl.hdu.edu.cn:8443/api/x"},
+		{"Host 为空则原样", "https://sso.hdu.edu.cn/api/x", "", "https://sso.hdu.edu.cn/api/x"},
+		{"Host 只有空白则原样", "https://sso.hdu.edu.cn/api/x", "  ", "https://sso.hdu.edu.cn/api/x"},
+		{"Host 与 URL 主机相同则原样", "https://skl.hdu.edu.cn/api/x", "skl.hdu.edu.cn", "https://skl.hdu.edu.cn/api/x"},
+		{"URL 不可解析则原样", "://bad", "skl.hdu.edu.cn", "://bad"},
+		{"URL 无权威则原样", "/api/x", "skl.hdu.edu.cn", "/api/x"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := authorityFromHost(tt.raw, tt.host); got != tt.want {
+				t.Fatalf("authorityFromHost(%q, %q) = %q, want %q", tt.raw, tt.host, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -97,7 +145,7 @@ func TestParseHARExchangeNoMatch(t *testing.T) {
 func TestParseHARExchangeBase64Body(t *testing.T) {
 	// {"captchaVerifyResult":true,"checkCodeDto":{}}
 	encoded := "eyJjYXB0Y2hhVmVyaWZ5UmVzdWx0Ijp0cnVlLCJjaGVja0NvZGVEdG8iOnt9fQ=="
-	entryJSON := `{"startedDateTime":"2026-09-15T10:00:00+08:00",
+	entryJSON := `{"startedDateTime":"2006-01-02T10:00:00+08:00",
 		"request":{"method":"POST","url":"https://skl.hdu.edu.cn/api/ali-nvc/captcha-verify?code=1"},
 		"response":{"status":200,"headers":[],"content":{"text":"` + encoded + `","encoding":"base64"}}}`
 
@@ -187,7 +235,7 @@ func TestHookHandlerDecompressesGzip(t *testing.T) {
 
 	select {
 	case e := <-ch:
-		if e.Status != 200 || e.Verdict != VerdictSuccess {
+		if e.Status != 200 || !strings.Contains(e.Body, "captchaVerifyResult") {
 			t.Fatalf("gzip 上报未被正确解析: %+v", e)
 		}
 	default:

@@ -17,8 +17,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/hdufuck/skl"
@@ -43,16 +43,21 @@ type options struct {
 	code   string
 	sample string
 
-	headed      bool
-	profile     string
-	noBrowser   bool
-	hookAddr    string
-	outDir      string
-	stopOnWrite bool
+	headed    bool
+	profile   string
+	noBrowser bool
+	hookAddr  string
+	outDir    string
+
+	// 浏览器自称。
+	mobile    bool
+	userAgent string
+	clientUA  string
+	// ladder 是本次要跑的档位（probe.ParseLadder 的输入）。
+	ladder string
 
 	ladderDeadline  time.Duration
 	captchaDeadline time.Duration
-	gateTimeout     time.Duration
 	hookWait        time.Duration
 	genuineAttempts int
 }
@@ -71,15 +76,21 @@ func run() error {
 
 	fs.BoolVar(&opt.headed, "headed", false, "用可见窗口跑 Chrome（默认 headless=new）")
 	fs.StringVar(&opt.profile, "profile", "", "Chrome 持久化 profile 目录")
-	fs.BoolVar(&opt.noBrowser, "no-browser", false, "跳过浏览器真值档（只跑档 1–4）")
+	fs.BoolVar(&opt.noBrowser, "no-browser", false, "跳过浏览器真值档（只跑前置三档）")
 	fs.StringVar(&opt.hookAddr, "hook", ":8080", "Reqable 上报服务器监听地址；空串关闭")
 	fs.StringVar(&opt.outDir, "out", "probe-results", "报告输出目录")
-	fs.BoolVar(&opt.stopOnWrite, "stop-after-write", false,
-		"检测到写入后按「首个写入即停」纪律终止后续档位（默认自动跑完全部档位）")
 
-	fs.DurationVar(&opt.ladderDeadline, "ladder-deadline", 8*time.Second, "档 1–4 的墙钟预算")
+	fs.BoolVar(&opt.mobile, "mobile", false,
+		"浏览器自称 Android 手机（UA、客户端提示、430×932 视口、触摸一起换；默认自称真实桌面 Chrome）")
+	fs.StringVar(&opt.userAgent, "ua", "",
+		"浏览器自称的 UA；留空 = 桌面用真实 UA 去掉 headless 标记、手机用内置 Android 模板（可粘钉钉那串）")
+	fs.StringVar(&opt.clientUA, "client-ua", "",
+		"skl HTTP 客户端的 User-Agent：留空 = 项目自报名；browser = 与浏览器自称一致；其它 = 原样使用")
+	fs.StringVar(&opt.ladder, "ladder", "",
+		"要跑的档位：留空/all = 全部四档；genuine = 只跑真值档；junk = 只跑前置三档；也可给逗号分隔的档位 ID")
+
+	fs.DurationVar(&opt.ladderDeadline, "ladder-deadline", 8*time.Second, "前置档（code-check-in / captcha-missing / captcha-forged）的墙钟预算")
 	fs.DurationVar(&opt.captchaDeadline, "captcha-deadline", 23*time.Second, "真值档的墙钟预算")
-	fs.DurationVar(&opt.gateTimeout, "gate-timeout", 5*time.Second, "写入后交互闸的倒计时")
 	fs.DurationVar(&opt.hookWait, "hook-wait", 10*time.Second, "等待手机 HAR 上报的时长")
 	fs.IntVar(&opt.genuineAttempts, "genuine-attempts", 3,
 		"真值档最多跑几次（每次重取一个新 captchaVerifyParam；`har#3` 抓包里三次提交才成功一次）")
@@ -138,9 +149,9 @@ func run() error {
 
 	baseline, err := probe.ReadBackToday(client)(loginCtx)
 	if err != nil {
-		return fmt.Errorf("读回预热失败（窗口内第一次解析失败就等于浪费机会）: %w", err)
+		return fmt.Errorf("读回预热失败（窗口内第一次读取失败就等于浪费机会）: %w", err)
 	}
-	logf("读回预热成功：今日签到明细 %d 条（基线）", baseline.Count)
+	logf("读回预热成功：今日考勤记录 %d 条（基线）", len(baseline))
 
 	sample := opt.sample
 	if sample == "" {
@@ -170,7 +181,18 @@ func run() error {
 		}
 	}
 
-	var captchaSource probe.CaptchaParamSource
+	ladder, err := probe.ParseLadder(opt.ladder)
+	if err != nil {
+		return err
+	}
+	if opt.noBrowser && slices.Contains(ladder, probe.RungCaptchaGenuine) {
+		return errors.New("--ladder 里的 captcha-verify-genuine 需要浏览器，不能与 --no-browser 同用")
+	}
+
+	var (
+		captchaSource probe.CaptchaParamSource
+		browserUA     string
+	)
 	if !opt.noBrowser {
 		browserCtx, cancelBrowser := context.WithCancel(ctx)
 		defer cancelBrowser()
@@ -178,12 +200,29 @@ func run() error {
 			Headless:    !opt.headed,
 			UserDataDir: profile,
 			Logf:        logf,
+			Mobile:      opt.mobile,
+			UserAgent:   opt.userAgent,
 		})
 		if err != nil {
 			return fmt.Errorf("浏览器预热失败: %w", err)
 		}
 		captchaSource = src
+		browserUA = src.UserAgent()
 		defer func() { _ = src.Close() }()
+	}
+
+	// 可选：让 skl HTTP 客户端与浏览器自称一致（默认保持项目自报名）。
+	switch {
+	case opt.clientUA == "browser":
+		if browserUA == "" {
+			return errors.New("--client-ua browser 需要浏览器预热，不能与 --no-browser 同用")
+		}
+		client.SetUserAgent(browserUA)
+	case opt.clientUA != "":
+		client.SetUserAgent(opt.clientUA)
+	}
+	if opt.clientUA != "" {
+		logf("skl 客户端 User-Agent = %s", client.UserAgent())
 	}
 
 	var hookCh chan probe.Entry
@@ -223,27 +262,25 @@ func run() error {
 	logf("T0=%s 开始阶梯（Ladder≤%s / 真值≤%s，真值档最多 %d 次）", time.Now().Format("15:04:05"),
 		opt.ladderDeadline, opt.captchaDeadline, opt.genuineAttempts)
 
-	prompter := &cliPrompter{in: in, out: os.Stderr}
+	prompter := &cliPrompter{out: os.Stderr}
 	rep, err := probe.Run(ctx, probe.Config{
-		Client:             client,
-		Recorder:           rec,
-		Code:               code,
-		UserID:             user.ID,
-		Coord:              probe.Coord{Lat: opt.lat, Lon: opt.lon},
-		Sample:             sample,
-		Captcha:            captchaSource,
-		SkipGenuine:        opt.noBrowser,
-		Prompter:           prompter,
-		Logf:               logf,
-		ReadBack:           probe.ReadBackToday(client),
-		Baseline:           &baseline,
-		Hook:               hookCh,
-		LadderDeadline:     opt.ladderDeadline,
-		CaptchaDeadline:    opt.captchaDeadline,
-		GateTimeout:        opt.gateTimeout,
-		HookWait:           opt.hookWait,
-		GenuineAttempts:    opt.genuineAttempts,
-		ContinueAfterWrite: !opt.stopOnWrite,
+		Client:          client,
+		Recorder:        rec,
+		Code:            code,
+		UserID:          user.ID,
+		Coord:           probe.Coord{Lat: opt.lat, Lon: opt.lon},
+		Sample:          sample,
+		Captcha:         captchaSource,
+		SkipGenuine:     opt.noBrowser,
+		Ladder:          ladder,
+		Prompter:        prompter,
+		ReadBack:        probe.ReadBackToday(client),
+		Baseline:        baseline,
+		Hook:            hookCh,
+		LadderDeadline:  opt.ladderDeadline,
+		CaptchaDeadline: opt.captchaDeadline,
+		HookWait:        opt.hookWait,
+		GenuineAttempts: opt.genuineAttempts,
 	})
 	if err != nil {
 		return err
@@ -279,12 +316,9 @@ func run() error {
 	fmt.Fprintf(os.Stderr, "\n原始报告（**未打码**，含真实 body；已 gitignore，不外传）: %s\n", jsonPath)
 	fmt.Fprintf(os.Stderr, "脱敏草稿（已按 §4.4 打码；人工确认后并入 docs/）: %s\n", mdPath)
 	fmt.Fprintln(os.Stderr, "提醒：上面这些终端输出未打码，不要整段复制出去；要带走就带走 md 草稿。")
-	if rep.WrittenWithoutCaptcha() {
-		fmt.Fprintln(os.Stderr, "结论：出现了「未用真凭证却写入记录」的档位 ⟹ 该路径不强制人机验证。")
-	}
 	if rep.GenuineUnproven() {
-		fmt.Fprintln(os.Stderr, "⚠ 真值档是 transport_error：请求根本没发出去，浏览器取参链路未走通。"+
-			"不要采信第 5 档的任何结论；先用无效码重跑演练（可加 --headed）把链路跑通。")
+		fmt.Fprintln(os.Stderr, "⚠ 真值档根本没拿到 HTTP 状态：浏览器取参链路未走通。"+
+			"不要采信它的任何结论；先用无效码重跑演练（可加 --headed）把链路跑通。")
 	}
 	if rep.HookMissing {
 		fmt.Fprintln(os.Stderr, "提示：未收到手机 HAR 上报。检查手机 Reqable 的上报服务器配置与局域网连通性；原始抓包仍可在 Reqable 里人工补。")
@@ -293,46 +327,9 @@ func run() error {
 	return nil
 }
 
-// cliPrompter 是命令行的交互实现。注意：只用文字提示，不响铃。
+// cliPrompter 是命令行的提示实现。注意：只用文字提示，不响铃。
 type cliPrompter struct {
-	in   *bufio.Reader
-	out  *os.File
-	once sync.Once
-	// lines 只由一个常驻 goroutine 写，避免每次 Gate 都新起一个读 stdin 的
-	// goroutine、在超时后互相抢输入。
-	lines chan string
-}
-
-func (p *cliPrompter) line() chan string {
-	p.once.Do(func() {
-		p.lines = make(chan string, 8)
-		go func() {
-			for {
-				s, err := p.in.ReadString('\n')
-				p.lines <- s
-				if err != nil {
-					return
-				}
-			}
-		}()
-	})
-	return p.lines
-}
-
-func (p *cliPrompter) Gate(ctx context.Context, entry probe.Entry, timeout time.Duration) (bool, error) {
-	fmt.Fprintf(p.out, "\n⚠ %s 写入了 %d 条新记录（%s）。\n",
-		entry.Rung, len(entry.NewKeys), strings.Join(entry.NewKeys, ", "))
-	fmt.Fprintf(p.out, "  %s 内按 c 回车继续跑后续档位；直接回车或超时则停止：", timeout)
-
-	select {
-	case line := <-p.line():
-		return strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "c"), nil
-	case <-time.After(timeout):
-		fmt.Fprintln(p.out)
-		return false, nil
-	case <-ctx.Done():
-		return false, ctx.Err()
-	}
+	out *os.File
 }
 
 func (p *cliPrompter) Notify(format string, args ...any) {

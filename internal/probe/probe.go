@@ -1,17 +1,16 @@
-// Package probe 实现「一次性签到探针」的纯逻辑部分：阶梯定义、请求判读、
-// 读回比对、脱敏与报告渲染。
+// Package probe 实现「一次性签到探针」的纯逻辑部分：阶梯定义、请求之后的
+// 考勤记录读回、脱敏与报告渲染。
 //
-// 这里的代码不直接发起任何网络请求，也不启动浏览器；网络与浏览器行为由
+// 它**不做判读**：只把每档的请求/响应，以及该档之后读到的考勤记录原样记下来，
+// 由人去看。这里的代码不直接发起任何网络请求，也不启动浏览器；网络与浏览器行为由
 // 调用方（cmd/signinprobe）注入，因此全部可单测。
 package probe
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/hdufuck/skl/pkg/signin"
@@ -26,9 +25,6 @@ const ToolVersion = "signinprobe/1"
 type RungID string
 
 const (
-	// RungAnalyzeA0 是遗留 JSONP 端点 `check-code-analyze`，显式上报 `a=0`
-	// （表示未做人机验证），且完全不传定位。
-	RungAnalyzeA0 RungID = "analyze-a0"
 	// RungLegacyCheckIn 是遗留端点 `code-check-in`，不传人机凭证，需要定位。
 	RungLegacyCheckIn RungID = "code-check-in"
 	// RungCaptchaMissing 是活路径 `captcha-verify`，**缺失** captchaVerifyParam。
@@ -44,13 +40,66 @@ const (
 
 // Ladder 是按开火顺序排列的全部档位。
 //
-// 不含 RungCaptchaGenuine 时即为「档 1–4」。
+// 不含 RungCaptchaGenuine 时即为「档 1–3」。
 var Ladder = []RungID{
-	RungAnalyzeA0,
 	RungLegacyCheckIn,
 	RungCaptchaMissing,
 	RungCaptchaForged,
 	RungCaptchaGenuine,
+}
+
+// ParseLadder 把命令行给出的阶梯规格解析成开火顺序。
+//
+// 接受的写法（大小写不敏感、首尾空格忽略）：
+//
+//	"" / "all"          → (nil, nil)：不覆盖，Run 回落到包级 Ladder 的默认顺序
+//	"genuine"            → 只跑真值档
+//	"junk"（别名 "pre"） → 三档非真值档，默认顺序
+//	逗号分隔的档位 ID     → 严格按给定顺序，如 "captcha-verify-genuine,code-check-in"
+//
+// 为什么需要「只跑真值档 / 把真值档排最前」：前置三档会在真值档之前几秒，
+// 对同一个 userid+scene 打出失败的（缺失/伪造）人机提交——这是真值档 F001
+// 判读的混淆项。真实窗口昂贵且一次性，操作者必须能排除这个先验污染，
+// 单独跑一次真值档来回答「库的 SignIn 路径能否走通」。
+//
+// 未识别的档位 ID、空的列表元素都返回错误，并在错误里列出合法档位。
+func ParseLadder(spec string) ([]RungID, error) {
+	s := strings.TrimSpace(spec)
+	switch strings.ToLower(s) {
+	case "", "all":
+		// 刻意返回 nil 而不是 Ladder 的副本：nil 表示「未覆盖」，
+		// 保证 Config.Ladder 与 Ladder 之间的默认语义只有一处。
+		return nil, nil
+	case "genuine":
+		return []RungID{RungCaptchaGenuine}, nil
+	case "junk", "pre":
+		return []RungID{RungLegacyCheckIn, RungCaptchaMissing, RungCaptchaForged}, nil
+	}
+
+	parts := strings.Split(s, ",")
+	out := make([]RungID, 0, len(parts))
+	for _, part := range parts {
+		id := RungID(strings.ToLower(strings.TrimSpace(part)))
+		if id == "" {
+			return nil, fmt.Errorf("probe: 阶梯规格 %q 里有空的档位 ID；合法档位：%s，或 all / genuine / junk",
+				spec, strings.Join(ladderIDs(), ", "))
+		}
+		if !slices.Contains(Ladder, id) {
+			return nil, fmt.Errorf("probe: 未知档位 %q；合法档位：%s，或 all / genuine / junk",
+				id, strings.Join(ladderIDs(), ", "))
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+// ladderIDs 返回 Ladder 上各档的 ID 字符串，用于错误提示。
+func ladderIDs() []string {
+	ids := make([]string, len(Ladder))
+	for i, r := range Ladder {
+		ids[i] = string(r)
+	}
+	return ids
 }
 
 // ParamKind 描述该档携带的人机凭证形态。
@@ -68,8 +117,6 @@ const (
 // Title 返回档位的中文标题。
 func (r RungID) Title() string {
 	switch r {
-	case RungAnalyzeA0:
-		return "遗留 JSONP check-code-analyze（a=0，无人机凭证，无定位）"
 	case RungLegacyCheckIn:
 		return "遗留 code-check-in（无人机凭证，带定位）"
 	case RungCaptchaMissing:
@@ -95,181 +142,6 @@ func (r RungID) ParamKind() ParamKind {
 	}
 }
 
-// Verdict 是一档探针的判读结论。
-type Verdict string
-
-const (
-	// VerdictSuccess：业务层明确成功（或真值档写入了记录）。
-	VerdictSuccess Verdict = "success"
-	// VerdictWrittenNoCaptcha：该档没带人机凭证/带的是假凭证，却写入了真实
-	// 考勤记录 —— 这是「不强制人机验证」的强证据。
-	VerdictWrittenNoCaptcha Verdict = "written_without_captcha"
-	// VerdictCaptchaRejected：响应明确指向人机层。
-	VerdictCaptchaRejected Verdict = "captcha_layer_rejected"
-	// VerdictParamRejected：参数层就要求人机凭证（400 + 参数缺失/非法）。
-	VerdictParamRejected Verdict = "param_layer_rejected"
-	// VerdictCodeRejected：签到码不存在/无效。因为签到码校验先于人机校验，
-	// 这条对「是否强制」不构成证据。
-	VerdictCodeRejected Verdict = "code_rejected"
-	// VerdictEmptyBody：200 但响应体为空（skl-ticket 重放或被 WAF 拦截）。
-	VerdictEmptyBody Verdict = "empty_body"
-	// VerdictURITooLong：请求行超长，被网关拒绝（`414` 是 `har#3` 实测；`413` 同类、未实测，一并归到这一类）。
-	//
-	// `har#3` 抓包第 6/10 条：`TRACELESS` 的 `data` 会膨胀到 25 KB 量级，
-	// 整条 URL 超过网关的请求行上限（实测包线：请求行 5615 ≤ L < 27839 字节，即完整 URL 5623 ≤ L < 27847），
-	// 服务端返回 `414 URI too long`（`text/plain`、无 CORS、
-	// 带 `X-Kong-Response-Latency`）——**应用层根本没收到这个请求**，
-	// 因此它既不指向人机层也不指向参数层，必须单独成一类。
-	VerdictURITooLong Verdict = "uri_too_long"
-	// VerdictUnattributable：无法归因。
-	VerdictUnattributable Verdict = "unattributable"
-	// VerdictTransportError：请求根本没发出去或读不到响应。
-	VerdictTransportError Verdict = "transport_error"
-)
-
-// Evidence 描述该判读结论的证据强度。
-func (v Verdict) Evidence() string {
-	switch v {
-	case VerdictSuccess:
-		return "强（业务成功）"
-	case VerdictWrittenNoCaptcha:
-		return "强（写入记录且未用真凭证）"
-	case VerdictCaptchaRejected:
-		return "强（指向人机层）"
-	case VerdictParamRejected:
-		return "强（指向参数层）"
-	case VerdictCodeRejected:
-		return "无（签到码先于风控校验）"
-	case VerdictEmptyBody:
-		return "无（工具/网络层）"
-	case VerdictURITooLong:
-		return "强（网关拒绝请求行，未达应用）"
-	case VerdictTransportError:
-		return "无（工具/网络层）"
-	default:
-		return "无（不可归因）"
-	}
-}
-
-// ClassifyInput 是判读一档探针所需的全部事实。
-//
-// 全部是字面量/可序列化值，便于把判读逻辑与 HTTP 客户端解耦。
-type ClassifyInput struct {
-	Rung   RungID
-	Status int
-	Body   []byte
-	// Err 非空表示传输层错误（此时 Status 通常为 0）。
-	Err string
-	// Wrote 表示读回端点在本次探针之后出现了新记录。
-	Wrote bool
-
-	// AnalyzeCode 是该档为 RungAnalyzeA0 时，JSONP 响应里的 result.code；
-	// 非该档时为 0。
-	AnalyzeCode int
-	// HasAnalyzeCode 区分 AnalyzeCode 的真实值 0 与「不适用」。
-	HasAnalyzeCode bool
-
-	// CaptchaVerifyResult 是响应里 captchaVerifyResult 的布尔值；缺失时为 nil。
-	CaptchaVerifyResult *bool
-	// CaptchaVerifyCode 是响应里 captchaVerifyCode 的值（成功 `T001` /
-	// 失败 `F001`）。该字段由 `har#3` 抓包首次观察到；为空串表示缺失。
-	CaptchaVerifyCode string
-	// CheckCodeDtoLen 是响应里 checkCodeDto 序列化后的字节长度。
-	CheckCodeDtoLen int
-}
-
-// Classify 把一档探针的观测映射成判读结论。
-//
-// 规则顺序即优先级：先看「有没有写入记录」（最强的行为证据），再看网关层，
-// 再看业务码，最后看文案。
-func Classify(in ClassifyInput) Verdict {
-	if in.Err != "" && in.Status == 0 {
-		return VerdictTransportError
-	}
-
-	if in.Wrote {
-		if in.Rung == RungCaptchaGenuine {
-			return VerdictSuccess
-		}
-		return VerdictWrittenNoCaptcha
-	}
-
-	if in.Status == 200 && len(strings.TrimSpace(string(in.Body))) == 0 {
-		return VerdictEmptyBody
-	}
-
-	// 网关在请求行阶段就拒了，应用层没有任何参与。
-	if in.Status == http.StatusRequestEntityTooLarge || in.Status == http.StatusRequestURITooLong {
-		return VerdictURITooLong
-	}
-
-	if in.HasAnalyzeCode {
-		switch in.AnalyzeCode {
-		case 100, 200:
-			return VerdictSuccess
-		case 400:
-			return VerdictCaptchaRejected
-		case 800, 900:
-			return VerdictCodeRejected
-		}
-	}
-
-	// captchaVerifyResult 是主判据；缺失时用 captchaVerifyCode 补充。
-	captchaResult := in.CaptchaVerifyResult
-	if captchaResult == nil {
-		if passed, ok := captchaCodeVerdict(in.CaptchaVerifyCode); ok {
-			captchaResult = &passed
-		}
-	}
-	if captchaResult != nil {
-		if !*captchaResult {
-			return VerdictCaptchaRejected
-		}
-		if in.CheckCodeDtoLen > 0 {
-			return VerdictSuccess
-		}
-		// captchaVerifyResult=true 但 checkCodeDto 为空：形状未知，不硬判。
-		return VerdictUnattributable
-	}
-
-	msg := extractMsg(in.Body)
-	switch {
-	case msg == "":
-		// 无 msg 可读时，只有活路径的 400 才敢归因到参数层。
-		if in.Status == 400 && isCaptchaRung(in.Rung) {
-			return VerdictParamRejected
-		}
-		return VerdictUnattributable
-	case containsAny(msg, "签到码"):
-		return VerdictCodeRejected
-	case containsAny(msg, "人机", "滑块", "验证码", "captcha", "Captcha"):
-		return VerdictCaptchaRejected
-	case in.Status == 400 && isCaptchaRung(in.Rung):
-		return VerdictParamRejected
-	default:
-		return VerdictUnattributable
-	}
-}
-
-func isCaptchaRung(r RungID) bool {
-	return r == RungCaptchaMissing || r == RungCaptchaForged || r == RungCaptchaGenuine
-}
-
-// captchaCodeVerdict 把 captchaVerifyCode 翻译成人机判定。
-//
-// 只认 `har#3` 抓包里实测到的两个值（成功 `T001` / 失败 `F001`）；
-// 其它值一律「没有意见」，交由 captchaVerifyResult 或文案判断。
-func captchaCodeVerdict(code string) (bool, bool) {
-	switch strings.ToUpper(strings.TrimSpace(code)) {
-	case "T001":
-		return true, true
-	case "F001":
-		return false, true
-	default:
-		return false, false
-	}
-}
-
 // LongestAcceptedURLLen 是 `har#3` 采集中**被服务端接受**的最长请求 URL
 // （字节，含 `https://skl.hdu.edu.cn` 的 22 字节）。
 //
@@ -291,74 +163,6 @@ func URLTooLongHint(urlLen int) string {
 	}
 	return fmt.Sprintf("URL 长 %d 字节，超过已实测的接受值（%d）⟹ 大概率被网关判 414（`har#3` 抓包）",
 		urlLen, LongestAcceptedURLLen)
-}
-
-// extractMsg 从 `{"code":0,"msg":"..."}` 形态里取 msg。
-func extractMsg(body []byte) string {
-	var envelope struct {
-		Msg string `json:"msg"`
-	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return ""
-	}
-	return envelope.Msg
-}
-
-func containsAny(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if strings.Contains(s, sub) {
-			return true
-		}
-	}
-	return false
-}
-
-// Snapshot 是某一时刻读回端点（今日签到明细）的观测。
-type Snapshot struct {
-	// Count 是明细条数。
-	Count int
-	// Keys 是每一条明细的稳定标识。
-	Keys []string
-}
-
-// NewKeys 返回相对 prev 新增的明细标识。
-func (s Snapshot) NewKeys(prev Snapshot) []string {
-	seen := make(map[string]struct{}, len(prev.Keys))
-	for _, k := range prev.Keys {
-		seen[k] = struct{}{}
-	}
-	var out []string
-	for _, k := range s.Keys {
-		if _, ok := seen[k]; !ok {
-			out = append(out, k)
-		}
-	}
-	return out
-}
-
-// SnapshotFromRaw 从 `/api/check-in-student-detail/my` 的裸数组里构造快照。
-//
-// 元素形态未实测，所以优先用 `id` 字段做稳定标识；没有 `id` 时退化为
-// 内容哈希（同一份内容前后一致即可用于 diff）。
-func SnapshotFromRaw(raw []json.RawMessage) Snapshot {
-	s := Snapshot{Count: len(raw)}
-	for _, item := range raw {
-		s.Keys = append(s.Keys, itemKey(item))
-	}
-	return s
-}
-
-func itemKey(item json.RawMessage) string {
-	var probe struct {
-		ID json.RawMessage `json:"id"`
-	}
-	if err := json.Unmarshal(item, &probe); err == nil && len(probe.ID) > 0 {
-		if s := strings.Trim(string(probe.ID), `"`); s != "" && s != "null" {
-			return "id:" + s
-		}
-	}
-	sum := sha256.Sum256(item)
-	return "sha256:" + hex.EncodeToString(sum[:8])
 }
 
 // ForgeParam 构造一个「结构合法但内容伪造」的 captchaVerifyParam。

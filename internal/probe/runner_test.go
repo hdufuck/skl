@@ -18,27 +18,25 @@ import (
 // fakeBackend 是一个可控的 skl 服务端替身。
 type fakeBackend struct {
 	mu      sync.Mutex
-	records []string
+	records []json.RawMessage
 	last    string
 
-	// Analyze 返回 (HTTP status, 业务 code)。
-	Analyze func(code string) (int, int)
-	// CheckIn 返回 (HTTP status, body, 是否写入记录)。
+	// CheckIn 返回 (HTTP status, body, 是否新增一条考勤记录)。
 	CheckIn func(code string) (int, string, bool)
-	// Captcha 返回 (HTTP status, body, 是否写入记录)。
+	// Captcha 返回 (HTTP status, body, 是否新增一条考勤记录)。
 	Captcha func(param, code string) (int, string, bool)
 }
 
-func (b *fakeBackend) addRecord(id string) {
+func (b *fakeBackend) addRecord(raw string) {
 	b.mu.Lock()
-	b.records = append(b.records, id)
+	b.records = append(b.records, json.RawMessage(raw))
 	b.mu.Unlock()
 }
 
-func (b *fakeBackend) snapshot() []string {
+func (b *fakeBackend) snapshot() []json.RawMessage {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]string{}, b.records...)
+	return append([]json.RawMessage{}, b.records...)
 }
 
 func (b *fakeBackend) lastParam() string {
@@ -51,26 +49,14 @@ func (b *fakeBackend) handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/check-in-student-detail/my", func(w http.ResponseWriter, _ *http.Request) {
-		arr := make([]json.RawMessage, 0)
-		for _, id := range b.snapshot() {
-			arr = append(arr, json.RawMessage(fmt.Sprintf(`{"id":%q}`, id)))
-		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(arr)
-	})
-
-	mux.HandleFunc(skl.PathSignInAnalyze, func(w http.ResponseWriter, r *http.Request) {
-		status, biz := b.Analyze(r.URL.Query().Get("code"))
-		cb := r.URL.Query().Get("callback")
-		w.Header().Set("Content-Type", "application/javascript")
-		w.WriteHeader(status)
-		fmt.Fprintf(w, "%s(%s)", cb, fmt.Sprintf(`{"result":{"code":%d}}`, biz))
+		_ = json.NewEncoder(w).Encode(b.snapshot())
 	})
 
 	mux.HandleFunc(skl.PathSignInLegacy, func(w http.ResponseWriter, r *http.Request) {
 		status, body, write := b.CheckIn(r.URL.Query().Get("code"))
 		if write {
-			b.addRecord("checkin-legacy")
+			b.addRecord(`{"id":"checkin-legacy","right":true}`)
 		}
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
@@ -83,33 +69,13 @@ func (b *fakeBackend) handler() http.Handler {
 		b.mu.Unlock()
 		status, body, write := b.Captcha(param, r.URL.Query().Get("code"))
 		if write {
-			b.addRecord("checkin-captcha")
+			b.addRecord(`{"id":"checkin-captcha","right":true}`)
 		}
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
 	})
 
 	return mux
-}
-
-type fakePrompter struct {
-	mu      sync.Mutex
-	answer  bool
-	gates   int
-	notices []string
-}
-
-func (p *fakePrompter) Gate(context.Context, Entry, time.Duration) (bool, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.gates++
-	return p.answer, nil
-}
-
-func (p *fakePrompter) Notify(format string, args ...any) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.notices = append(p.notices, fmt.Sprintf(format, args...))
 }
 
 type fakeCaptchaSource struct {
@@ -157,7 +123,6 @@ func baseConfig(client *skl.Client, rec *Recorder) Config {
 
 func TestRunAllCodeRejected(t *testing.T) {
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
 		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 		Captcha: func(string, string) (int, string, bool) { return 401, codeRejectedBody, false },
 	}
@@ -170,28 +135,64 @@ func TestRunAllCodeRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if len(rep.Entries) != 4 {
-		t.Fatalf("档位数 = %d, want 4", len(rep.Entries))
+	if len(rep.Entries) != 3 {
+		t.Fatalf("档位数 = %d, want 3", len(rep.Entries))
 	}
 	for _, e := range rep.Entries {
-		if e.Verdict != VerdictCodeRejected {
-			t.Fatalf("%s 判读 = %s, want code_rejected", e.Rung, e.Verdict)
+		if e.Status != 401 {
+			t.Fatalf("%s 状态码 = %d, want 401", e.Rung, e.Status)
 		}
-	}
-	if rep.StoppedAt != "" {
-		t.Fatalf("不应停止，却停在 %s", rep.StoppedAt)
-	}
-	if rep.WrittenWithoutCaptcha() {
-		t.Fatal("不应出现不强制人机的证据")
+		if e.AfterRequest == nil || len(e.AfterRequest) != 0 {
+			t.Fatalf("%s 请求后应记录到 0 条考勤记录，实际 %v", e.Rung, e.AfterRequest)
+		}
 	}
 	if len(backend.snapshot()) != 0 {
 		t.Fatalf("不应写入记录: %v", backend.snapshot())
 	}
 }
 
-func TestRunLegacyWriteStopsByDefault(t *testing.T) {
+// 每档请求之后都要把当时的考勤记录原样记下来：新增的那条只应出现在它之后
+// 那一档的 AfterRequest 里，之前几档仍为空。
+func TestRunRecordsCheckInAfterEachRung(t *testing.T) {
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
+		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
+		Captcha: func(param, _ string) (int, string, bool) {
+			// 缺失档不写；伪造档写一条。
+			if param == "" {
+				return 401, codeRejectedBody, false
+			}
+			return 200, `{"captchaVerifyResult":true,"checkCodeDto":{"id":"x"}}`, true
+		},
+	}
+	client, rec, _ := newTestClient(t, backend)
+
+	cfg := baseConfig(client, rec)
+	cfg.SkipGenuine = true
+
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(rep.Entries) != 3 {
+		t.Fatalf("档位数 = %d, want 3", len(rep.Entries))
+	}
+	if got := len(rep.Entries[0].AfterRequest); got != 0 {
+		t.Fatalf("第 1 档之后应无记录，实际 %d 条", got)
+	}
+	if got := len(rep.Entries[1].AfterRequest); got != 0 {
+		t.Fatalf("第 2 档之后应无记录，实际 %d 条", got)
+	}
+	if got := len(rep.Entries[2].AfterRequest); got != 1 {
+		t.Fatalf("第 3 档之后应记录到 1 条，实际 %d 条：%s", got, rep.Entries[2].AfterRequest)
+	}
+	if !strings.Contains(string(rep.Entries[2].AfterRequest[0]), "checkin-captcha") {
+		t.Fatalf("记录的原始记录不对: %s", rep.Entries[2].AfterRequest[0])
+	}
+}
+
+// 写入不再是运行决策：无论哪一档写入，阶梯都会跑完。
+func TestRunKeepsGoingAfterWrite(t *testing.T) {
+	backend := &fakeBackend{
 		CheckIn: func(string) (int, string, bool) {
 			return 200, `{"captchaVerifyResult":true,"checkCodeDto":{"id":"x"}}`, true
 		},
@@ -199,39 +200,27 @@ func TestRunLegacyWriteStopsByDefault(t *testing.T) {
 	}
 	client, rec, _ := newTestClient(t, backend)
 
-	rep, err := Run(context.Background(), baseConfig(client, rec))
+	cfg := baseConfig(client, rec)
+	cfg.SkipGenuine = true
+
+	rep, err := Run(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-
-	if len(rep.Entries) != 2 {
-		t.Fatalf("应在第 2 档后停止，实际执行 %d 档", len(rep.Entries))
+	if len(rep.Entries) != 3 {
+		t.Fatalf("写入后仍应跑完全部档位，实际 %d 档", len(rep.Entries))
 	}
-	last := rep.Entries[1]
-	if last.Rung != RungLegacyCheckIn {
-		t.Fatalf("停在第 %s 档", last.Rung)
-	}
-	if last.Verdict != VerdictWrittenNoCaptcha {
-		t.Fatalf("判读 = %s, want written_without_captcha", last.Verdict)
-	}
-	if !last.Wrote || len(last.NewKeys) != 1 || last.NewKeys[0] != "id:checkin-legacy" {
-		t.Fatalf("读回 diff 不对: %+v", last)
-	}
-	if rep.StoppedAt != RungLegacyCheckIn {
-		t.Fatalf("StoppedAt = %s, want %s", rep.StoppedAt, RungLegacyCheckIn)
-	}
-	if !rep.WrittenWithoutCaptcha() {
-		t.Fatal("应判定为不强制人机")
+	if len(rep.Entries[0].AfterRequest) != 1 {
+		t.Fatalf("第 1 档之后应记录到写入的那条: %v", rep.Entries[0].AfterRequest)
 	}
 }
 
 func TestRunGenuineSucceeds(t *testing.T) {
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
 		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 		Captcha: func(param, _ string) (int, string, bool) {
 			if param == "GENUINE" {
-				return 200, `{"captchaVerifyResult":true,"checkCodeDto":{"id":"c1"}}`, true
+				return 200, `{"captchaVerifyResult":true,"captchaVerifyCode":"T001","checkCodeDto":{"id":"c1"}}`, true
 			}
 			return 401, codeRejectedBody, false
 		},
@@ -246,15 +235,12 @@ func TestRunGenuineSucceeds(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if len(rep.Entries) != 5 {
-		t.Fatalf("档位数 = %d, want 5", len(rep.Entries))
+	if len(rep.Entries) != 4 {
+		t.Fatalf("档位数 = %d, want 4", len(rep.Entries))
 	}
-	genuine := rep.Entries[4]
+	genuine := rep.Entries[3]
 	if genuine.Rung != RungCaptchaGenuine {
-		t.Fatalf("第 5 档 = %s", genuine.Rung)
-	}
-	if genuine.Verdict != VerdictSuccess {
-		t.Fatalf("真值档判读 = %s, want success", genuine.Verdict)
+		t.Fatalf("最后一档 = %s", genuine.Rung)
 	}
 	if genuine.ParamKind != ParamGenuine {
 		t.Fatalf("凭证形态 = %s, want genuine", genuine.ParamKind)
@@ -262,17 +248,19 @@ func TestRunGenuineSucceeds(t *testing.T) {
 	if !strings.Contains(genuine.URL, "captchaVerifyParam=") {
 		t.Fatalf("URL 里应带真值参数: %s", genuine.URL)
 	}
-	if rep.StoppedAt != RungCaptchaGenuine {
-		t.Fatalf("StoppedAt = %s, want %s", rep.StoppedAt, RungCaptchaGenuine)
+	if genuine.CaptchaVerifyCode != "T001" {
+		t.Fatalf("captchaVerifyCode = %q, want T001", genuine.CaptchaVerifyCode)
 	}
-	if got := rep.Successes(); len(got) != 1 || got[0] != RungCaptchaGenuine {
-		t.Fatalf("Successes = %v", got)
+	if genuine.Status != 200 {
+		t.Fatalf("状态码 = %d, want 200", genuine.Status)
+	}
+	if len(genuine.AfterRequest) != 1 {
+		t.Fatalf("真值档之后应记录到 1 条考勤记录: %v", genuine.AfterRequest)
 	}
 }
 
 func TestRunForgedParamIsStructurallyValid(t *testing.T) {
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
 		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 		Captcha: func(string, string) (int, string, bool) { return 401, codeRejectedBody, false },
 	}
@@ -280,6 +268,7 @@ func TestRunForgedParamIsStructurallyValid(t *testing.T) {
 
 	cfg := baseConfig(client, rec)
 	cfg.Sample = `{"sceneId":"2q42bw25","certifyId":"kVBJ80iOKt","deviceToken":"V0VCI2Fi","data":"JRMlgg1E"}`
+	cfg.SkipGenuine = true
 
 	if _, err := Run(context.Background(), cfg); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -296,42 +285,8 @@ func TestRunForgedParamIsStructurallyValid(t *testing.T) {
 	}
 }
 
-func TestRunGateContinue(t *testing.T) {
-	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
-		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
-		Captcha: func(param, _ string) (int, string, bool) {
-			if param == "GENUINE" {
-				return 200, `{"captchaVerifyResult":true,"checkCodeDto":{"id":"c1"}}`, true
-			}
-			return 401, codeRejectedBody, false
-		},
-	}
-	client, rec, _ := newTestClient(t, backend)
-
-	prompter := &fakePrompter{answer: true}
-	cfg := baseConfig(client, rec)
-	cfg.Prompter = prompter
-	cfg.Captcha = &fakeCaptchaSource{value: "GENUINE"}
-
-	rep, err := Run(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if len(rep.Entries) != 5 {
-		t.Fatalf("交互闸返回继续时应跑满 5 档，实际 %d", len(rep.Entries))
-	}
-	if prompter.gates != 1 {
-		t.Fatalf("Gates = %d, want 1", prompter.gates)
-	}
-	if rep.StoppedAt != "" {
-		t.Fatalf("不应停止: %s", rep.StoppedAt)
-	}
-}
-
 func TestRunSkipsGenuineOverBudget(t *testing.T) {
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
 		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 		Captcha: func(param, _ string) (int, string, bool) {
 			if param == "GENUINE" {
@@ -350,7 +305,7 @@ func TestRunSkipsGenuineOverBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if len(rep.Entries) != 4 {
+	if len(rep.Entries) != 3 {
 		t.Fatalf("超出预算时应跳过真值档，实际 %d 档", len(rep.Entries))
 	}
 	if len(rep.Notes) == 0 {
@@ -361,7 +316,6 @@ func TestRunSkipsGenuineOverBudget(t *testing.T) {
 func TestRunPhoneHook(t *testing.T) {
 	newBackend := func() *fakeBackend {
 		return &fakeBackend{
-			Analyze: func(string) (int, int) { return 200, 800 },
 			CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 			Captcha: func(string, string) (int, string, bool) { return 401, codeRejectedBody, false },
 		}
@@ -459,7 +413,6 @@ func TestRunPhoneHook(t *testing.T) {
 func TestRunRetriesOnEmptyBody(t *testing.T) {
 	var calls atomic.Int32
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
 		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 		Captcha: func(string, string) (int, string, bool) {
 			// 第一次返回「200 + 空 body」（模拟 skl-ticket 重放被拒）。
@@ -479,18 +432,15 @@ func TestRunRetriesOnEmptyBody(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	missing := rep.Entries[2]
+	missing := rep.Entries[1]
 	if missing.Rung != RungCaptchaMissing {
-		t.Fatalf("第 3 档 = %s", missing.Rung)
+		t.Fatalf("第 2 档 = %s", missing.Rung)
 	}
 	if missing.Status != 401 {
 		t.Fatalf("重发后应记录最终响应 401，实际 %d", missing.Status)
 	}
 	if !strings.Contains(missing.Note, "重发") {
 		t.Fatalf("应在备注里标明重发: %q", missing.Note)
-	}
-	if missing.Verdict != VerdictCodeRejected {
-		t.Fatalf("判读 = %s, want code_rejected", missing.Verdict)
 	}
 	// 缺失档被请求两次（首次空 body + 重发），随后的伪造档一次。
 	if got := calls.Load(); got != 3 {
@@ -500,7 +450,6 @@ func TestRunRetriesOnEmptyBody(t *testing.T) {
 
 func TestRunRecordsRawExchange(t *testing.T) {
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
 		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 		Captcha: func(string, string) (int, string, bool) { return 401, codeRejectedBody, false },
 	}
@@ -513,19 +462,18 @@ func TestRunRecordsRawExchange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	analyze := rep.Entries[0]
-	if analyze.Status != 200 || !strings.Contains(analyze.Body, `"code":800`) {
-		t.Fatalf("analyze 原始响应未记录: %+v", analyze)
+	checkIn := rep.Entries[0]
+	if checkIn.Rung != RungLegacyCheckIn {
+		t.Fatalf("第 1 档 = %s", checkIn.Rung)
 	}
-	if analyze.RespHeaders["Content-Type"] == "" {
-		t.Fatalf("响应头未记录: %+v", analyze.RespHeaders)
-	}
-	checkIn := rep.Entries[1]
 	if checkIn.Status != 401 || !strings.Contains(checkIn.Body, "签到码不存在") {
-		t.Fatalf("check-in 原始响应未记录: %+v", checkIn)
+		t.Fatalf("code-check-in 原始响应未记录: %+v", checkIn)
 	}
 	if !strings.Contains(checkIn.URL, "code=1234") {
 		t.Fatalf("URL 未记录: %s", checkIn.URL)
+	}
+	if checkIn.RespHeaders["Content-Type"] == "" {
+		t.Fatalf("响应头未记录（HTTP 200 才带；这里为 401 也无妨）: %+v", checkIn.RespHeaders)
 	}
 }
 
@@ -550,7 +498,6 @@ const uriTooLongBody = "URI too long\n"
 func TestRunGenuineRetriesAfterURITooLong(t *testing.T) {
 	var genuineCalls atomic.Int32
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
 		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 		Captcha: func(param, _ string) (int, string, bool) {
 			if param != "GENUINE" {
@@ -573,10 +520,7 @@ func TestRunGenuineRetriesAfterURITooLong(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	genuine := rep.Entries[4]
-	if genuine.Verdict != VerdictSuccess {
-		t.Fatalf("真值档判读 = %s, want success（414 后应重取成功）", genuine.Verdict)
-	}
+	genuine := rep.Entries[3]
 	if genuine.Status != 200 {
 		t.Fatalf("最终记录的状态码 = %d, want 200（不能被首次 414 覆盖）", genuine.Status)
 	}
@@ -605,7 +549,6 @@ func TestRunGenuineRetriesAfterURITooLong(t *testing.T) {
 func TestRunGenuineRetriesAfterCaptchaRejected(t *testing.T) {
 	var genuineCalls atomic.Int32
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
 		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 		Captcha: func(param, _ string) (int, string, bool) {
 			if param != "GENUINE" {
@@ -628,10 +571,7 @@ func TestRunGenuineRetriesAfterCaptchaRejected(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	genuine := rep.Entries[4]
-	if genuine.Verdict != VerdictSuccess {
-		t.Fatalf("真值档判读 = %s, want success（F001 后应重取）", genuine.Verdict)
-	}
+	genuine := rep.Entries[3]
 	if src.used != 2 {
 		t.Fatalf("取参次数 = %d, want 2", src.used)
 	}
@@ -647,10 +587,9 @@ func TestRunGenuineRetriesAfterCaptchaRejected(t *testing.T) {
 	}
 }
 
-// 判读已经明确（例如签到码不存在）时不该浪费窗口去重取参数。
-func TestRunGenuineDoesNotRetryWhenDecidable(t *testing.T) {
+// 签到码不存在这类明确的响应不该浪费窗口去重取参数。
+func TestRunGenuineDoesNotRetryOnCodeRejected(t *testing.T) {
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
 		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 		Captcha: func(string, string) (int, string, bool) { return 401, codeRejectedBody, false },
 	}
@@ -667,18 +606,14 @@ func TestRunGenuineDoesNotRetryWhenDecidable(t *testing.T) {
 	if src.used != 1 {
 		t.Fatalf("取参次数 = %d, want 1（不该白重取）", src.used)
 	}
-	if v := rep.Entries[4].Verdict; v != VerdictCodeRejected {
-		t.Fatalf("判读 = %s, want code_rejected", v)
-	}
-	if len(rep.Entries[4].Attempts) != 1 {
-		t.Fatalf("往返次数 = %d, want 1", len(rep.Entries[4].Attempts))
+	if len(rep.Entries[3].Attempts) != 1 {
+		t.Fatalf("往返次数 = %d, want 1", len(rep.Entries[3].Attempts))
 	}
 }
 
-// GenuineAttempts=1 时退化成「只打一枪」，并且 414 仍要单独归因（不是不可归因）。
-func TestRunGenuineAttemptsBudgetAndURITooLongVerdict(t *testing.T) {
+// GenuineAttempts=1 时退化成「只打一枪」，且 414 会如实记录。
+func TestRunGenuineAttemptsBudget(t *testing.T) {
 	backend := &fakeBackend{
-		Analyze: func(string) (int, int) { return 200, 800 },
 		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
 		Captcha: func(param, _ string) (int, string, bool) {
 			if param != "GENUINE" {
@@ -698,12 +633,9 @@ func TestRunGenuineAttemptsBudgetAndURITooLongVerdict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	genuine := rep.Entries[4]
+	genuine := rep.Entries[3]
 	if src.used != 1 {
 		t.Fatalf("取参次数 = %d, want 1", src.used)
-	}
-	if genuine.Verdict != VerdictURITooLong {
-		t.Fatalf("判读 = %s, want uri_too_long（网关拒绝请求行，不是 unattributable）", genuine.Verdict)
 	}
 	if genuine.Status != 414 {
 		t.Fatalf("状态码 = %d, want 414", genuine.Status)
@@ -711,5 +643,25 @@ func TestRunGenuineAttemptsBudgetAndURITooLongVerdict(t *testing.T) {
 	// 重试预算耗尽时给出可读原因，而不是静默停在 414 上。
 	if !strings.Contains(genuine.Note, "上限") {
 		t.Fatalf("备注应说明未重取的原因（预算上限）: %q", genuine.Note)
+	}
+}
+
+// 真值档连 HTTP 状态都没拿到时，报告要能指出来。
+func TestRunGenuineUnproven(t *testing.T) {
+	backend := &fakeBackend{
+		CheckIn: func(string) (int, string, bool) { return 401, codeRejectedBody, false },
+		Captcha: func(string, string) (int, string, bool) { return 401, codeRejectedBody, false },
+	}
+	client, rec, _ := newTestClient(t, backend)
+
+	cfg := baseConfig(client, rec)
+	cfg.Captcha = &fakeCaptchaSource{err: fmt.Errorf("SDK 未出参")}
+
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !rep.GenuineUnproven() {
+		t.Fatalf("真值档没拿到状态却没报 GenuineUnproven: %+v", rep.Entries[3])
 	}
 }
